@@ -1,0 +1,383 @@
+
+============================================================
+C:\Projects\Loan Operation Intelligence\backend\app\agents\conversation_tracker.py
+============================================================
+"""
+Conversation State Tracker — LangGraph Graph (Q1)
+
+Tracks and validates conversation state as Vapi tool calls come in.
+Does NOT replace the LLM — augments it with structured state management.
+
+Graph nodes:
+- update_phase: Determine current conversation phase from events
+- check_compliance: Verify required disclosures have been made
+- evaluate_rules: Run business rules against current state
+- log_transition: Record state transitions for audit trail
+
+Used for:
+- Ensuring conversation follows the expected flow
+- Triggering compliance checks at appropriate phases
+- Auto-escalation when business rules fire
+- Analytics on conversation patterns
+"""
+
+import logging
+from langgraph.graph import StateGraph, END
+
+from app.agents.states import ConversationState
+
+logger = logging.getLogger(__name__)
+
+
+# --- Node Functions ---
+
+def update_phase(state: ConversationState) -> ConversationState:
+    """
+    Determine the current conversation phase based on the latest events.
+    
+    Phase transitions:
+    greeting → verify → remind → objection/question → options → commit/callback/escalate → wrap_up
+    """
+    messages = state.get("messages", [])
+    current_phase = state.get("current_phase", "greeting")
+    
+    # TODO: Implement phase detection logic based on latest messages
+    # Analyze the last message/tool call to determine phase transition
+    
+    return {**state, "current_phase": current_phase}
+
+
+def check_compliance(state: ConversationState) -> ConversationState:
+    """
+    Check if required compliance disclosures have been made.
+    
+    Updates the compliance_checklist based on conversation content.
+    """
+    checklist = state.get("compliance_checklist", {
+        "identity_disclosed": False,
+        "purpose_stated": False,
+        "recording_mentioned": False,
+    })
+    
+    messages = state.get("messages", [])
+    
+    # TODO: Scan messages for compliance keywords
+    # Update checklist based on what's been said
+    
+    return {**state, "compliance_checklist": checklist}
+
+
+def evaluate_rules(state: ConversationState) -> ConversationState:
+    """
+    Evaluate business rules against the current conversation state.
+    
+    May trigger auto-escalation, compliance warnings, etc.
+    """
+    # TODO: Call RuleEngine.evaluate() with current state
+    # If escalation rule fires, update phase to "escalate"
+    
+    objection_count = len(state.get("objections_raised", []))
+    verification_attempts = state.get("verification_attempts", 0)
+    
+    # Auto-escalate rules
+    if verification_attempts >= 3:
+        return {**state, "current_phase": "escalate", "escalation_reason": "Verification failed 3 times"}
+    
+    if objection_count >= 3:
+        return {**state, "current_phase": "escalate", "escalation_reason": "Multiple unresolved objections"}
+    
+    return state
+
+
+def log_transition(state: ConversationState) -> ConversationState:
+    """Log the state transition for audit trail."""
+    logger.info(
+        f"Call {state.get('call_id')}: "
+        f"phase={state.get('current_phase')} "
+        f"turn={state.get('turn_count', 0)} "
+        f"objections={len(state.get('objections_raised', []))}"
+    )
+    return state
+
+
+def should_continue(state: ConversationState) -> str:
+    """Determine if the conversation should continue or end."""
+    phase = state.get("current_phase", "")
+    if phase in ("wrap_up", "escalate"):
+        return "end"
+    return "continue"
+
+
+# --- Build Graph ---
+
+def build_conversation_tracker() -> StateGraph:
+    """
+    Build the LangGraph conversation state tracker.
+    
+    Returns a compiled StateGraph that can be invoked per-turn:
+        graph = build_conversation_tracker()
+        compiled = graph.compile()
+        result = compiled.invoke(state)
+    """
+    graph = StateGraph(ConversationState)
+    
+    # Add nodes
+    graph.add_node("update_phase", update_phase)
+    graph.add_node("check_compliance", check_compliance)
+    graph.add_node("evaluate_rules", evaluate_rules)
+    graph.add_node("log_transition", log_transition)
+    
+    # Define edges
+    graph.set_entry_point("update_phase")
+    graph.add_edge("update_phase", "check_compliance")
+    graph.add_edge("check_compliance", "evaluate_rules")
+    graph.add_edge("evaluate_rules", "log_transition")
+    
+    # Conditional exit
+    graph.add_conditional_edges(
+        "log_transition",
+        should_continue,
+        {
+            "continue": END,
+            "end": END,
+        },
+    )
+    
+    return graph
+
+============================================================
+C:\Projects\Loan Operation Intelligence\backend\app\agents\nudge_pipeline.py
+============================================================
+"""
+Nudge Pipeline — LangGraph Graph (Q4)
+
+Orchestrates the real-time nudge generation pipeline:
+1. ingest_audio → Receive audio chunk
+2. transcribe → Streaming ASR via Deepgram
+3. buffer_transcript → Accumulate transcript segments
+4. extract_signals → LLM-based signal detection
+5. generate_nudge → Create actionable nudge text
+6. apply_controls → Filter by confidence, dedup, cooldown
+7. deliver_nudge → Publish via Redis pub/sub
+8. log_metrics → Record latency and quality metrics
+
+This graph is invoked per-chunk as audio streams in.
+"""
+
+import logging
+from langgraph.graph import StateGraph, END
+
+from app.agents.states import NudgePipelineState
+
+logger = logging.getLogger(__name__)
+
+
+# --- Node Functions ---
+
+def ingest_audio(state: NudgePipelineState) -> NudgePipelineState:
+    """Receive and buffer an audio chunk."""
+    chunk_count = state.get("chunk_count", 0) + 1
+    return {**state, "chunk_count": chunk_count}
+
+
+def transcribe(state: NudgePipelineState) -> NudgePipelineState:
+    """Send audio chunk to Deepgram streaming ASR."""
+    # TODO: Call StreamingASR.transcribe_chunk()
+    # Update transcript_segments with new segment
+    return state
+
+
+def buffer_transcript(state: NudgePipelineState) -> NudgePipelineState:
+    """Accumulate transcript segments into buffer."""
+    segments = state.get("transcript_segments", [])
+    buffer = " ".join(seg["text"] for seg in segments)
+    return {**state, "transcript_buffer": buffer}
+
+
+def should_extract(state: NudgePipelineState) -> str:
+    """Check if enough new content to warrant signal extraction."""
+    buffer = state.get("transcript_buffer", "")
+    last_pos = state.get("last_processed_position", 0)
+    new_text = buffer[last_pos:]
+    
+    if len(new_text.split()) >= 30:
+        return "extract"
+    return "skip"
+
+
+def extract_signals(state: NudgePipelineState) -> NudgePipelineState:
+    """Run LLM-based signal extraction on new transcript content."""
+    # TODO: Call SignalExtractor.extract()
+    # Add detected signals to active_signals
+    return state
+
+
+def generate_nudge(state: NudgePipelineState) -> NudgePipelineState:
+    """Generate actionable nudge text from detected signals."""
+    # TODO: Call SignalExtractor.generate_nudge() for each active signal
+    return state
+
+
+def apply_controls(state: NudgePipelineState) -> NudgePipelineState:
+    """Apply nudge control rules (confidence, dedup, cooldown, max)."""
+    # TODO: Filter nudges through control pipeline
+    return state
+
+
+def deliver_nudge(state: NudgePipelineState) -> NudgePipelineState:
+    """Publish approved nudges via Redis pub/sub."""
+    # TODO: Call publish_nudge() for each approved nudge
+    return state
+
+
+def log_metrics(state: NudgePipelineState) -> NudgePipelineState:
+    """Record latency and quality metrics."""
+    # TODO: Log component-level latency to latency_log
+    return state
+
+
+# --- Build Graph ---
+
+def build_nudge_pipeline() -> StateGraph:
+    """
+    Build the LangGraph nudge pipeline.
+    
+    Returns a compiled StateGraph invoked per audio chunk.
+    """
+    graph = StateGraph(NudgePipelineState)
+    
+    # Add nodes
+    graph.add_node("ingest_audio", ingest_audio)
+    graph.add_node("transcribe", transcribe)
+    graph.add_node("buffer_transcript", buffer_transcript)
+    graph.add_node("extract_signals", extract_signals)
+    graph.add_node("generate_nudge", generate_nudge)
+    graph.add_node("apply_controls", apply_controls)
+    graph.add_node("deliver_nudge", deliver_nudge)
+    graph.add_node("log_metrics", log_metrics)
+    
+    # Define flow
+    graph.set_entry_point("ingest_audio")
+    graph.add_edge("ingest_audio", "transcribe")
+    graph.add_edge("transcribe", "buffer_transcript")
+    
+    # Conditional: extract only if enough new content
+    graph.add_conditional_edges(
+        "buffer_transcript",
+        should_extract,
+        {
+            "extract": "extract_signals",
+            "skip": END,
+        },
+    )
+    
+    graph.add_edge("extract_signals", "generate_nudge")
+    graph.add_edge("generate_nudge", "apply_controls")
+    graph.add_edge("apply_controls", "deliver_nudge")
+    graph.add_edge("deliver_nudge", "log_metrics")
+    graph.add_edge("log_metrics", END)
+    
+    return graph
+
+============================================================
+C:\Projects\Loan Operation Intelligence\backend\app\agents\states.py
+============================================================
+"""
+LangGraph State Definitions
+
+TypedDict state classes for:
+1. ConversationState — Voice agent conversation tracking (Q1)
+2. NudgePipelineState — Real-time nudge generation pipeline (Q4)
+"""
+
+from typing import TypedDict, Literal
+
+
+class ConversationState(TypedDict):
+    """
+    State for the voice agent conversation tracker (Q1).
+    
+    Tracks conversation phase, borrower details, objections,
+    questions, compliance checklist, and outcome.
+    """
+    # Call identification
+    call_id: str
+    
+    # Borrower info (populated during verification)
+    borrower_name: str | None
+    loan_id: str | None
+    loan_type: str | None
+    amount_due: float | None
+    due_date: str | None
+    
+    # Conversation state
+    current_phase: str  # greeting | verify | remind | objection | question | options | commit | callback | escalate | wrap_up
+    verification_attempts: int
+    objections_raised: list[str]
+    questions_asked: list[str]
+    
+    # RAG context tracking (for citations)
+    rag_contexts_used: list[dict]
+    
+    # Outcomes
+    commitment: dict | None  # {date, amount, method}
+    callback: dict | None    # {date, time, reason}
+    escalation_reason: str | None
+    
+    # Compliance tracking
+    compliance_checklist: dict  # {identity_disclosed: bool, purpose_stated: bool, recording_mentioned: bool}
+    
+    # Analytics
+    sentiment_trajectory: list[str]  # per-turn sentiment
+    turn_count: int
+    
+    # Conversation history
+    messages: list[dict]
+
+
+class NudgePipelineState(TypedDict):
+    """
+    State for the real-time nudge pipeline (Q4).
+    
+    Tracks audio processing, transcript buffering,
+    signal detection, nudge generation, and delivery.
+    """
+    # Session identification
+    call_id: str
+    session_id: str
+    
+    # Audio processing
+    audio_buffer: bytes
+    chunk_count: int
+    
+    # Transcript
+    transcript_buffer: str
+    transcript_segments: list[dict]  # [{text, speaker, start, end, confidence}]
+    last_processed_position: int
+    
+    # Signal detection
+    active_signals: list[dict]
+    signal_history: list[dict]
+    
+    # Nudge generation
+    generated_nudges: list[dict]
+    delivered_nudges: list[dict]
+    suppressed_nudges: list[dict]
+    
+    # Nudge control state
+    nudge_hash_history: list[str]  # for dedup
+    last_nudge_timestamp: float    # for cooldown
+    total_delivered: int           # for max per call
+    
+    # Latency tracking
+    latency_log: list[dict]  # [{component, latency_ms, timestamp}]
+    
+    # Analytics
+    compliance_flags: list[str]
+    sentiment_score: float
+    turn_count: int
+
+============================================================
+C:\Projects\Loan Operation Intelligence\backend\app\agents\__init__.py
+============================================================
+"""LangGraph Agents Package."""

@@ -1,0 +1,80 @@
+[
+  {
+    "test_id": "rag_001",
+    "query": "What is the late payment penalty for a personal loan?",
+    "expected_category": "policy",
+    "expected_keywords": [
+      "late payment",
+      "penalty",
+      "2%",
+      "overdue"
+    ],
+    "description": "Policy question about late payment fees"
+  },
+  {
+    "test_id": "rag_002",
+    "query": "What payment methods are available for EMI payment?",
+    "expected_category": "payment",
+    "expected_keywords": [
+      "online",
+      "bank transfer",
+      "UPI",
+      "auto-debit"
+    ],
+    "description": "FAQ about EMI payment methods"
+  },
+  {
+    "test_id": "rag_003",
+    "query": "I cannot afford to pay this month, what are my options?",
+    "expected_category": "objection",
+    "expected_keywords": [
+      "hardship",
+      "restructuring",
+      "EMI holiday"
+    ],
+    "description": "Objection handling for financial difficulty"
+  },
+  {
+    "test_id": "rag_004",
+    "query": "What happens if my loan becomes NPA?",
+    "expected_category": "policy",
+    "expected_keywords": [
+      "NPA",
+      "non-performing",
+      "90 days",
+      "overdue"
+    ],
+    "description": "Policy question about NPA classification"
+  },
+  {
+    "test_id": "rag_005",
+    "query": "How do I prepay my home loan?",
+    "expected_category": "product",
+    "expected_keywords": [
+      "prepay",
+      "home loan",
+      "foreclosure"
+    ],
+    "description": "Product question about home loan prepayment"
+  },
+  {
+    "test_id": "rag_006",
+    "query": "I want to file a complaint about the service",
+    "expected_category": "escalation",
+    "expected_keywords": [
+      "complaint",
+      "grievance"
+    ],
+    "description": "Escalation trigger — complaint handling"
+  },
+  {
+    "test_id": "rag_007",
+    "query": "Is there a grace period for my payment?",
+    "expected_category": "policy",
+    "expected_keywords": [
+      "grace period",
+      "3 days"
+    ],
+    "description": "FAQ about grace period"
+  }
+]

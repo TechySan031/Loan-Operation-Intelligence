@@ -1,0 +1,42 @@
+[
+  {
+    "test_id": "nudge_001",
+    "scenario": "compliance_gap",
+    "description": "Agent skips required identity disclosure",
+    "transcript_segment": "Agent: Hi, your loan payment of 15000 rupees is due on February 15th.\nCustomer: Wait, who is this?",
+    "expected_signal": "compliance_gap",
+    "expected_nudge": "Identify yourself and the company before sharing payment details."
+  },
+  {
+    "test_id": "nudge_002",
+    "scenario": "missed_cross_sell",
+    "description": "Customer mentions second loan, agent doesn't follow up",
+    "transcript_segment": "Customer: I'm also paying another loan with a different bank, the interest rate is very high there.\nAgent: Let's focus on your payment with us.",
+    "expected_signal": "cross_sell",
+    "expected_nudge": "Customer mentioned high-interest loan elsewhere. Offer to review consolidation options."
+  },
+  {
+    "test_id": "nudge_003",
+    "scenario": "rising_frustration",
+    "description": "Customer becomes increasingly frustrated",
+    "transcript_segment": "Customer: I already told you three times, I can't pay right now! Why do you keep calling me? This is harassment!",
+    "expected_signal": "sentiment",
+    "expected_nudge": "Customer frustration is high. Acknowledge their concern and offer escalation."
+  },
+  {
+    "test_id": "nudge_004",
+    "scenario": "payment_difficulty",
+    "description": "Customer indicates financial hardship",
+    "transcript_segment": "Customer: My wife is in the hospital and the medical bills are very high. I just don't have the money this month.",
+    "expected_signal": "payment_difficulty",
+    "expected_nudge": "Customer is in financial hardship. Offer approved hardship or payment extension program."
+  },
+  {
+    "test_id": "nudge_005",
+    "scenario": "noisy_false_positive",
+    "description": "Ambiguous call where no nudge should be generated",
+    "transcript_segment": "Agent: Good morning, this is Sarah from FinServ. Am I speaking with Mr. Kumar?\nCustomer: Yes, that's me. What is this about?",
+    "expected_signal": null,
+    "expected_nudge": null
+  }
+]
