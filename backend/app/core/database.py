@@ -24,8 +24,16 @@ class Base(DeclarativeBase):
 
 
 # --- Engine & Session Factory ---
+database_url = settings.DATABASE_URL.replace(
+    "postgresql://",
+    "postgresql+asyncpg://",
+    1,
+)
+
+print("DATABASE URL:", database_url)
+
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    database_url,
     echo=settings.APP_DEBUG,
     pool_size=10,
     max_overflow=20,
@@ -41,12 +49,9 @@ async_session_factory = async_sessionmaker(
 
 # --- Lifecycle ---
 async def init_db():
-    """Initialize database connection pool. Called on app startup."""
-    # In production, Alembic handles schema creation.
-    # For dev, optionally create tables:
-    # async with engine.begin() as conn:
-    #     await conn.run_sync(Base.metadata.create_all)
-    pass
+    """Initialize database and create tables if they don't exist."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 async def close_db():
