@@ -5,6 +5,7 @@ All configuration is loaded from environment variables / .env file.
 Validates at startup so missing keys fail fast.
 """
 
+from transformers.models.chameleon import image_processing_chameleon_fast
 import os
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -84,14 +85,15 @@ class Settings(BaseSettings):
     PII_DETECTION_THRESHOLD: float = 0.7
 
     def model_post_init(self, __context):
-        """Build composite URLs from component parts if shell interpolation failed."""
-        # Fix DATABASE_URL if it contains unresolved ${} or is empty
-        if not self.DATABASE_URL or "${" in self.DATABASE_URL:
-            self.DATABASE_URL = (
-                f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-                f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        # Convert Railway DATABASE_URL to asyncpg format
+        if self.DATABASE_URL.startswith("postgresql://"):
+            self.DATABASE_URL = self.DATABASE_URL.replace(
+                "postgresql://",
+                "postgresql+asyncpg://",
+                1,
             )
-        # Fix REDIS_URL similarly
+
+        # Build Redis URL only if needed
         if not self.REDIS_URL or "${" in self.REDIS_URL:
             self.REDIS_URL = f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
 

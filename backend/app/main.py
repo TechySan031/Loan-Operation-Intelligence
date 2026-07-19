@@ -6,6 +6,7 @@ sets up middleware, and manages application lifecycle (startup/shutdown).
 """
 
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,49 +22,61 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifecycle: startup and shutdown hooks."""
     # --- Startup ---
-    # Database — required
-    from app.core.database import init_db, close_db
-    await init_db()
-    logger.info("✅ PostgreSQL connected")
+    # We offload service checks and client initializations to a background task
+    # so Uvicorn can immediately bind to $PORT and start accepting connections.
+    async def initialize_services():
+        # Database
+        try:
+            from app.core.database import init_db
+            await init_db()
+            logger.info("✅ PostgreSQL connection verified")
+        except Exception as e:
+            logger.error(f"❌ PostgreSQL connection failed: {e}")
 
-    # Redis — required for nudges, optional otherwise
-    try:
-        from app.core.redis import init_redis, close_redis
-        await init_redis()
-        logger.info("✅ Redis connected")
-    except Exception as e:
-        logger.warning(f"⚠️  Redis unavailable: {e} — nudge streaming disabled")
+        # Redis — required for nudges, optional otherwise
+        try:
+            from app.core.redis import init_redis
+            await init_redis()
+            logger.info("✅ Redis connected")
+        except Exception as e:
+            logger.warning(f"⚠️  Redis unavailable: {e} — nudge streaming disabled")
 
-    # Pinecone — optional (RAG won't work without it)
-    try:
-        from app.core.pinecone_client import init_pinecone
-        init_pinecone()
-        logger.info("✅ Pinecone connected")
-    except Exception as e:
-        logger.warning(f"⚠️  Pinecone unavailable: {e} — RAG disabled")
+        # Pinecone — optional (RAG won't work without it)
+        try:
+            from app.core.pinecone_client import init_pinecone
+            # Pinecone list_indexes() performs blocking network DNS lookups.
+            # Run in executor to prevent freezing the ASGI loop thread.
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, init_pinecone)
+            logger.info("✅ Pinecone connected")
+        except Exception as e:
+            logger.warning(f"⚠️  Pinecone unavailable: {e} — RAG disabled")
 
-    # Langfuse — optional (observability)
-    try:
-        from app.core.langfuse_client import init_langfuse
-        init_langfuse()
-        logger.info("✅ Langfuse initialized")
-    except Exception as e:
-        logger.warning(f"⚠️  Langfuse unavailable: {e}")
+        # Langfuse — optional (observability)
+        try:
+            from app.core.langfuse_client import init_langfuse
+            init_langfuse()
+            logger.info("✅ Langfuse initialized")
+        except Exception as e:
+            logger.warning(f"⚠️  Langfuse unavailable: {e}")
 
-    logger.info("🚀 Loan Operation Intelligence started")
+        logger.info("🚀 All external services initialization checks completed")
+
+    # Launch initialization concurrently
+    asyncio.create_task(initialize_services())
+    logger.info("🚀 Startup lifecycle initialized. Port binding in progress.")
 
     yield
 
+   
     # --- Shutdown ---
-    from app.core.database import close_db
-    await close_db()
     try:
         from app.core.redis import close_redis
         await close_redis()
     except Exception:
         pass
-    logger.info("👋 Shutdown complete")
 
+    logger.info("👋 Application shutdown complete")
 
 def create_app() -> FastAPI:
     """Factory function to create and configure the FastAPI application."""
