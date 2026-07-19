@@ -73,12 +73,22 @@ class RAGService:
         return embedding
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts. More efficient than calling embed_text() N times."""
+        """Embed a batch of texts in small sub-batches to prevent memory spikes (OOM)."""
         loop = asyncio.get_running_loop()
-        embeddings = await loop.run_in_executor(
-            None,
-            lambda: self.model.encode(texts, normalize_embeddings=True).tolist(),
-        )
+        
+        def encode_in_sub_batches():
+            import torch
+            torch.set_grad_enabled(False)
+            
+            sub_batch_size = 4
+            all_embeddings = []
+            for i in range(0, len(texts), sub_batch_size):
+                sub_batch = texts[i : i + sub_batch_size]
+                emb = self.model.encode(sub_batch, normalize_embeddings=True).tolist()
+                all_embeddings.extend(emb)
+            return all_embeddings
+
+        embeddings = await loop.run_in_executor(None, encode_in_sub_batches)
         return embeddings
 
     # ── Search Pipeline ────────────────────────────────────────
