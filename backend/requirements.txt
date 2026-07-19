@@ -1,0 +1,55 @@
+# === Core ===
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+python-multipart==0.0.20
+
+# === Database ===
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.1
+greenlet==3.1.1
+
+# === Redis ===
+redis[hiredis]==5.2.1
+
+# === Vector DB ===
+pinecone-client==5.0.1
+
+# === LLM / Embeddings ===
+openai==1.59.7
+langchain-openai==0.3.0
+langchain-core==0.3.30
+langgraph==0.2.60
+sentence-transformers==3.0.1
+
+# === Voice Platform ===
+# Vapi is API-only, no SDK needed (HTTP calls)
+httpx==0.28.1
+
+# === Streaming ASR (Q4) ===
+deepgram-sdk==3.8.0 
+
+# === Observability ===
+langfuse==2.57.4
+
+# === PII Detection ===
+presidio-analyzer==2.2.356
+presidio-anonymizer==2.2.356
+
+# === Data Processing ===
+beautifulsoup4==4.12.3
+pypdf==5.1.0
+tiktoken==0.8.0
+pandas==2.2.3
+
+# === Testing ===
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+httpx==0.28.1
+
+# === Dev ===
+ruff==0.8.6

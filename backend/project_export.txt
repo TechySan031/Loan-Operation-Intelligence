@@ -1,0 +1,5422 @@
+========================================================================================================================
+FILE: app\__init__.py
+========================================================================================================================
+"""Loan Operation Intelligence — Backend Package"""
+
+========================================================================================================================
+FILE: app\agents\__init__.py
+========================================================================================================================
+"""LangGraph Agents Package."""
+
+========================================================================================================================
+FILE: app\agents\conversation_tracker.py
+========================================================================================================================
+"""Conversation state tracker for the real-time voice workflow."""
+
+import logging
+import re
+
+
+from langgraph.graph import END, StateGraph
+
+from app.agents.states import ConversationState
+
+logger = logging.getLogger(__name__)
+
+_PHASES = (
+    ("escalate", ("supervisor", "human agent", "complaint", "escalate")),
+    ("callback", ("call me back", "call back", "callback", "later today")),
+    ("commit", ("i will pay", "will make payment", "pay on", "payment by")),
+    ("objection", ("can't pay", "cannot pay", "too much", "not able to", "financial difficulty")),
+    ("question", ("?", "what is", "why is", "how do", "when is")),
+    ("options", ("payment option", "installment", "payment plan", "can pay via")),
+    ("remind", ("amount due", "payment due", "emi due", "installment due")),
+    ("verify", ("verify", "date of birth", "last four", "confirm your identity")),
+    ("greeting", ("hello", "good morning", "good afternoon", "good evening")),
+)
+
+
+def _message_text(messages: list[dict]) -> str:
+    return " ".join(str(message.get("content") or message.get("text") or "") for message in messages).lower()
+
+
+def update_phase(state: ConversationState) -> ConversationState:
+    """Advance state from the latest utterances without regressing terminal states."""
+    current = state.get("current_phase", "greeting")
+    if current in {"wrap_up", "escalate"}:
+        return state
+    latest = _message_text(state.get("messages", [])[-2:])
+    phase = current
+    for candidate, phrases in _PHASES:
+        if any(phrase in latest for phrase in phrases):
+            phase = candidate
+            break
+    attempts = state.get("verification_attempts", 0)
+    if phase == "verify" and re.search(r"\b(incorrect|wrong|no)\b", latest):
+        attempts += 1
+    return {**state, "current_phase": phase, "verification_attempts": attempts, "turn_count": state.get("turn_count", 0) + 1}
+
+
+def check_compliance(state: ConversationState) -> ConversationState:
+    """Update the required disclosure checklist from the transcript."""
+    transcript = _message_text(state.get("messages", []))
+    checklist = dict(state.get("compliance_checklist", {}))
+    checklist.update({
+        "identity_disclosed": any(value in transcript for value in ("my name is", "calling from", "on behalf of")),
+        "purpose_stated": any(value in transcript for value in ("payment reminder", "upcoming payment", "emi due", "installment due")),
+        "recording_mentioned": any(value in transcript for value in ("recorded", "recording", "quality purposes")),
+    })
+    return {**state, "compliance_checklist": checklist}
+
+
+def evaluate_rules(state: ConversationState) -> ConversationState:
+    """Apply deterministic safety escalations and injected rule-engine actions."""
+    if state.get("verification_attempts", 0) >= 3:
+        return {**state, "current_phase": "escalate", "escalation_reason": "Verification failed 3 times"}
+    if len(state.get("objections_raised", [])) >= 3:
+        return {**state, "current_phase": "escalate", "escalation_reason": "Multiple unresolved objections"}
+    for result in state.get("rule_actions", []):
+        action = result.get("action", result)
+        if action.get("type") in {"escalate", "transfer"} or action.get("escalate"):
+            return {**state, "current_phase": "escalate", "escalation_reason": action.get("reason", result.get("name", "Business rule triggered"))}
+    return state
+
+
+def log_transition(state: ConversationState) -> ConversationState:
+    logger.info("Call %s: phase=%s turn=%s objections=%s", state.get("call_id"), state.get("current_phase"), state.get("turn_count", 0), len(state.get("objections_raised", [])))
+    return state
+
+
+def should_continue(state: ConversationState) -> str:
+    return "end" if state.get("current_phase") in {"wrap_up", "escalate"} else "continue"
+
+
+def build_conversation_tracker() -> StateGraph:
+    graph = StateGraph(ConversationState)
+    for node in (update_phase, check_compliance, evaluate_rules, log_transition):
+        graph.add_node(node.__name__, node)
+    graph.set_entry_point("update_phase")
+    graph.add_edge("update_phase", "check_compliance")
+    graph.add_edge("check_compliance", "evaluate_rules")
+    graph.add_edge("evaluate_rules", "log_transition")
+    graph.add_conditional_edges("log_transition", should_continue, {"continue": END, "end": END})
+    return graph
+
+========================================================================================================================
+FILE: app\agents\nudge_pipeline.py
+========================================================================================================================
+"""
+Nudge Pipeline — LangGraph Graph (Q4)
+
+Orchestrates the real-time nudge generation pipeline:
+1. ingest_audio → Receive audio chunk
+2. transcribe → Streaming ASR via Deepgram
+3. buffer_transcript → Accumulate transcript segments
+4. extract_signals → LLM-based signal detection
+5. generate_nudge → Create actionable nudge text
+6. apply_controls → Filter by confidence, dedup, cooldown
+7. deliver_nudge → Publish via Redis pub/sub
+8. log_metrics → Record latency and quality metrics
+
+This graph is invoked per-chunk as audio streams in.
+"""
+
+import logging
+from langgraph.graph import StateGraph, END
+
+from app.agents.states import NudgePipelineState
+
+logger = logging.getLogger(__name__)
+
+
+# --- Node Functions ---
+
+def ingest_audio(state: NudgePipelineState) -> NudgePipelineState:
+    """Receive and buffer an audio chunk."""
+    chunk_count = state.get("chunk_count", 0) + 1
+    return {**state, "chunk_count": chunk_count}
+
+
+def transcribe(state: NudgePipelineState) -> NudgePipelineState:
+    """Send audio chunk to Deepgram streaming ASR."""
+    # TODO: Call StreamingASR.transcribe_chunk()
+    # Update transcript_segments with new segment
+    return state
+
+
+def buffer_transcript(state: NudgePipelineState) -> NudgePipelineState:
+    """Accumulate transcript segments into buffer."""
+    segments = state.get("transcript_segments", [])
+    buffer = " ".join(seg["text"] for seg in segments)
+    return {**state, "transcript_buffer": buffer}
+
+
+def should_extract(state: NudgePipelineState) -> str:
+    """Check if enough new content to warrant signal extraction."""
+    buffer = state.get("transcript_buffer", "")
+    last_pos = state.get("last_processed_position", 0)
+    new_text = buffer[last_pos:]
+    
+    if len(new_text.split()) >= 30:
+        return "extract"
+    return "skip"
+
+
+def extract_signals(state: NudgePipelineState) -> NudgePipelineState:
+    """Run LLM-based signal extraction on new transcript content."""
+    # TODO: Call SignalExtractor.extract()
+    # Add detected signals to active_signals
+    return state
+
+
+def generate_nudge(state: NudgePipelineState) -> NudgePipelineState:
+    """Generate actionable nudge text from detected signals."""
+    # TODO: Call SignalExtractor.generate_nudge() for each active signal
+    return state
+
+
+def apply_controls(state: NudgePipelineState) -> NudgePipelineState:
+    """Apply nudge control rules (confidence, dedup, cooldown, max)."""
+    # TODO: Filter nudges through control pipeline
+    return state
+
+
+def deliver_nudge(state: NudgePipelineState) -> NudgePipelineState:
+    """Publish approved nudges via Redis pub/sub."""
+    # TODO: Call publish_nudge() for each approved nudge
+    return state
+
+
+def log_metrics(state: NudgePipelineState) -> NudgePipelineState:
+    """Record latency and quality metrics."""
+    # TODO: Log component-level latency to latency_log
+    return state
+
+
+# --- Build Graph ---
+
+def build_nudge_pipeline() -> StateGraph:
+    """
+    Build the LangGraph nudge pipeline.
+    
+    Returns a compiled StateGraph invoked per audio chunk.
+    """
+    graph = StateGraph(NudgePipelineState)
+    
+    # Add nodes
+    graph.add_node("ingest_audio", ingest_audio)
+    graph.add_node("transcribe", transcribe)
+    graph.add_node("buffer_transcript", buffer_transcript)
+    graph.add_node("extract_signals", extract_signals)
+    graph.add_node("generate_nudge", generate_nudge)
+    graph.add_node("apply_controls", apply_controls)
+    graph.add_node("deliver_nudge", deliver_nudge)
+    graph.add_node("log_metrics", log_metrics)
+    
+    # Define flow
+    graph.set_entry_point("ingest_audio")
+    graph.add_edge("ingest_audio", "transcribe")
+    graph.add_edge("transcribe", "buffer_transcript")
+    
+    # Conditional: extract only if enough new content
+    graph.add_conditional_edges(
+        "buffer_transcript",
+        should_extract,
+        {
+            "extract": "extract_signals",
+            "skip": END,
+        },
+    )
+    
+    graph.add_edge("extract_signals", "generate_nudge")
+    graph.add_edge("generate_nudge", "apply_controls")
+    graph.add_edge("apply_controls", "deliver_nudge")
+    graph.add_edge("deliver_nudge", "log_metrics")
+    graph.add_edge("log_metrics", END)
+    
+    return graph
+
+========================================================================================================================
+FILE: app\agents\states.py
+========================================================================================================================
+"""
+LangGraph State Definitions
+
+TypedDict state classes for:
+1. ConversationState — Voice agent conversation tracking (Q1)
+2. NudgePipelineState — Real-time nudge generation pipeline (Q4)
+"""
+
+from typing import TypedDict, Literal
+
+
+class ConversationState(TypedDict):
+    """
+    State for the voice agent conversation tracker (Q1).
+    
+    Tracks conversation phase, borrower details, objections,
+    questions, compliance checklist, and outcome.
+    """
+    # Call identification
+    call_id: str
+    
+    # Borrower info (populated during verification)
+    borrower_name: str | None
+    loan_id: str | None
+    loan_type: str | None
+    amount_due: float | None
+    due_date: str | None
+    
+    # Conversation state
+    current_phase: str  # greeting | verify | remind | objection | question | options | commit | callback | escalate | wrap_up
+    verification_attempts: int
+    objections_raised: list[str]
+    questions_asked: list[str]
+    
+    # RAG context tracking (for citations)
+    rag_contexts_used: list[dict]
+    
+    # Outcomes
+    commitment: dict | None  # {date, amount, method}
+    callback: dict | None    # {date, time, reason}
+    escalation_reason: str | None
+    
+    # Compliance tracking
+    compliance_checklist: dict  # {identity_disclosed: bool, purpose_stated: bool, recording_mentioned: bool}
+    
+    # Analytics
+    sentiment_trajectory: list[str]  # per-turn sentiment
+    turn_count: int
+    
+    # Conversation history
+    messages: list[dict]
+
+
+class NudgePipelineState(TypedDict):
+    """
+    State for the real-time nudge pipeline (Q4).
+    
+    Tracks audio processing, transcript buffering,
+    signal detection, nudge generation, and delivery.
+    """
+    # Session identification
+    call_id: str
+    session_id: str
+    
+    # Audio processing
+    audio_buffer: bytes
+    chunk_count: int
+    
+    # Transcript
+    transcript_buffer: str
+    transcript_segments: list[dict]  # [{text, speaker, start, end, confidence}]
+    last_processed_position: int
+    
+    # Signal detection
+    active_signals: list[dict]
+    signal_history: list[dict]
+    
+    # Nudge generation
+    generated_nudges: list[dict]
+    delivered_nudges: list[dict]
+    suppressed_nudges: list[dict]
+    
+    # Nudge control state
+    nudge_hash_history: list[str]  # for dedup
+    last_nudge_timestamp: float    # for cooldown
+    total_delivered: int           # for max per call
+    
+    # Latency tracking
+    latency_log: list[dict]  # [{component, latency_ms, timestamp}]
+    
+    # Analytics
+    compliance_flags: list[str]
+    sentiment_score: float
+    turn_count: int
+
+========================================================================================================================
+FILE: app\config.py
+========================================================================================================================
+"""
+Application Configuration — Pydantic Settings
+
+All configuration is loaded from environment variables / .env file.
+Validates at startup so missing keys fail fast.
+"""
+
+import os
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _find_env_file() -> str:
+    """Find .env file — checks backend/ first, then project root."""
+    # When running from backend/
+    if os.path.exists(".env"):
+        return ".env"
+    # Check project root (parent of backend/)
+    parent = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", ".env")
+    if os.path.exists(parent):
+        return os.path.abspath(parent)
+    return ".env"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=_find_env_file(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # --- Application ---
+    APP_ENV: str = "development"
+    APP_DEBUG: bool = True
+    APP_HOST: str = "0.0.0.0"
+    APP_PORT: int = 8000
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # --- PostgreSQL ---
+    # NOTE: .env uses ${VAR} shell interpolation which pydantic doesn't support.
+    # This default is used when DATABASE_URL isn't resolved properly.
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    POSTGRES_USER: str = "loi_user"
+    POSTGRES_PASSWORD: str = "changeme"
+    POSTGRES_DB: str = "loan_operation_intelligence"
+    DATABASE_URL: str = ""
+
+    # --- Redis ---
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_URL: str = ""
+
+    # --- OpenAI ---
+    OPENAI_API_KEY: str = ""
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    OPENAI_LLM_MODEL: str = "gpt-4o"
+    OPENAI_LLM_MODEL_MINI: str = "gpt-4o-mini"
+
+    # --- Pinecone ---
+    PINECONE_API_KEY: str = ""
+    PINECONE_INDEX_NAME: str = "loan-kb"
+    PINECONE_ENVIRONMENT: str = "us-east-1"
+
+    # --- Vapi.ai ---
+    VAPI_API_KEY: str = ""
+    VAPI_ASSISTANT_ID_EN: str = ""
+    VAPI_ASSISTANT_ID_PH: str = ""
+    VAPI_ASSISTANT_ID_ID: str = ""
+    VAPI_PHONE_NUMBER_ID: str = ""
+    VAPI_WEBHOOK_SECRET: str = ""
+    VAPI_SERVER_URL: str = ""
+
+    # --- Deepgram ---
+    DEEPGRAM_API_KEY: str = ""
+
+    # --- Langfuse ---
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_HOST: str = "https://cloud.langfuse.com"
+
+    # --- PII ---
+    PII_DETECTION_ENABLED: bool = True
+    PII_DETECTION_THRESHOLD: float = 0.7
+
+    def model_post_init(self, __context):
+        """Build composite URLs from component parts if shell interpolation failed."""
+        # Fix DATABASE_URL if it contains unresolved ${} or is empty
+        if not self.DATABASE_URL or "${" in self.DATABASE_URL:
+            self.DATABASE_URL = (
+                f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+                f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+            )
+        # Fix REDIS_URL similarly
+        if not self.REDIS_URL or "${" in self.REDIS_URL:
+            self.REDIS_URL = f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
+
+
+settings = Settings()
+
+========================================================================================================================
+FILE: app\core\__init__.py
+========================================================================================================================
+"""Core infrastructure package."""
+
+========================================================================================================================
+FILE: app\core\database.py
+========================================================================================================================
+"""
+PostgreSQL Database — Async SQLAlchemy Engine
+
+Provides:
+- Async engine and session factory
+- Dependency injection for FastAPI routes
+- Base model for all ORM models
+- Startup/shutdown lifecycle hooks
+"""
+
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase
+
+from app.config import settings
+
+
+class Base(DeclarativeBase):
+    """Base class for all SQLAlchemy ORM models."""
+    pass
+
+
+# --- Engine & Session Factory ---
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=settings.APP_DEBUG,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+)
+
+async_session_factory = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+
+# --- Lifecycle ---
+async def init_db():
+    """Initialize database connection pool. Called on app startup."""
+    # In production, Alembic handles schema creation.
+    # For dev, optionally create tables:
+    # async with engine.begin() as conn:
+    #     await conn.run_sync(Base.metadata.create_all)
+    pass
+
+
+async def close_db():
+    """Close database connection pool. Called on app shutdown."""
+    await engine.dispose()
+
+
+# --- FastAPI Dependency ---
+async def get_db() -> AsyncSession:
+    """
+    Dependency that provides an async database session.
+    Usage in routes:
+        async def my_route(db: AsyncSession = Depends(get_db)):
+    """
+    async with async_session_factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+========================================================================================================================
+FILE: app\core\langfuse_client.py
+========================================================================================================================
+"""
+Langfuse Client — LLM Observability
+
+Provides:
+- Trace creation for LLM calls
+- Span tracking for RAG pipeline components
+- Evaluation scoring
+- Used across voice agent, RAG service, and nudge engine
+
+Pattern reused from Production GenAI MLOps Platform.
+"""
+
+import logging
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Try to import Langfuse, gracefully handle if not installed
+try:
+    from langfuse import Langfuse
+    LANGFUSE_AVAILABLE = True
+except ImportError:
+    LANGFUSE_AVAILABLE = False
+
+
+# --- Global Client ---
+langfuse_client: Langfuse | None = None
+
+
+def init_langfuse():
+    """Initialize Langfuse client. Called on app startup."""
+    global langfuse_client
+
+    if not LANGFUSE_AVAILABLE:
+        logger.warning("Langfuse package not installed. Observability disabled.")
+        return
+    
+    if not settings.LANGFUSE_PUBLIC_KEY or not settings.LANGFUSE_SECRET_KEY:
+        logger.warning("Langfuse keys not configured. Observability disabled.")
+        return
+    
+    langfuse_client = Langfuse(
+        public_key=settings.LANGFUSE_PUBLIC_KEY,
+        secret_key=settings.LANGFUSE_SECRET_KEY,
+        host=settings.LANGFUSE_HOST,
+    )
+
+
+def get_langfuse() -> Langfuse | None:
+    """Get the Langfuse client. Returns None if not configured."""
+    return langfuse_client
+
+
+def create_trace(name: str, metadata: dict | None = None, **kwargs):
+    """
+    Create a new Langfuse trace.
+    
+    Args:
+        name: Trace name (e.g., "voice_call", "rag_query", "nudge_generation")
+        metadata: Additional metadata dict
+    
+    Returns:
+        Langfuse trace object, or None if Langfuse not configured
+    """
+    if langfuse_client is None:
+        return None
+    
+    return langfuse_client.trace(
+        name=name,
+        metadata=metadata or {},
+        **kwargs,
+    )
+
+
+def score_trace(trace_id: str, name: str, value: float, comment: str = ""):
+    """
+    Score a trace for evaluation.
+    
+    Args:
+        trace_id: ID of the trace to score
+        name: Score name (e.g., "retrieval_relevance", "nudge_accuracy")
+        value: Score value (0.0 - 1.0)
+        comment: Optional explanation
+    """
+    if langfuse_client is None:
+        return
+    
+    langfuse_client.score(
+        trace_id=trace_id,
+        name=name,
+        value=value,
+        comment=comment,
+    )
+
+
+def flush():
+    """Flush pending Langfuse events. Call before shutdown."""
+    if langfuse_client:
+        langfuse_client.flush()
+
+========================================================================================================================
+FILE: app\core\pinecone_client.py
+========================================================================================================================
+"""
+Pinecone Client — Vector Database
+
+Provides:
+- Pinecone index initialization
+- Upsert, query, and delete operations
+- Metadata-filtered similarity search
+- Used by RAG service for knowledge base retrieval
+"""
+
+from pinecone import Pinecone, ServerlessSpec
+
+from app.config import settings
+
+
+# --- Global Client ---
+pc: Pinecone | None = None
+index = None
+
+
+def init_pinecone():
+    """Initialize Pinecone client and ensure index exists. Called on app startup."""
+    global pc, index
+
+    pc = Pinecone(api_key=settings.PINECONE_API_KEY)
+
+    # Create index if it doesn't exist
+    existing_indexes = [idx.name for idx in pc.list_indexes()]
+    if settings.PINECONE_INDEX_NAME not in existing_indexes:
+        pc.create_index(
+            name=settings.PINECONE_INDEX_NAME,
+            dimension=1536,  # text-embedding-3-small dimension
+            metric="cosine",
+            spec=ServerlessSpec(
+                cloud="aws",
+                region=settings.PINECONE_ENVIRONMENT,
+            ),
+        )
+
+    index = pc.Index(settings.PINECONE_INDEX_NAME)
+
+
+def get_pinecone_index():
+    """Get the Pinecone index. Raises if not initialized."""
+    if index is None:
+        raise RuntimeError("Pinecone not initialized. Call init_pinecone() first.")
+    return index
+
+
+# --- Operations ---
+def upsert_vectors(vectors: list[dict]):
+    """
+    Upsert vectors into Pinecone.
+    
+    Args:
+        vectors: List of dicts with keys: id, values, metadata
+    
+    Example:
+        upsert_vectors([{
+            "id": "kb_loan_001_chunk_0",
+            "values": [0.1, 0.2, ...],  # 1536-dim embedding
+            "metadata": {
+                "record_id": "kb_loan_001",
+                "category": "policy",
+                "product_type": "personal_loan",
+                "language": "en",
+                "title": "Late Payment Policy",
+                "content_preview": "First 200 chars..."
+            }
+        }])
+    """
+    idx = get_pinecone_index()
+    # Pinecone recommends batches of 100
+    batch_size = 100
+    for i in range(0, len(vectors), batch_size):
+        batch = vectors[i : i + batch_size]
+        idx.upsert(vectors=batch)
+
+
+def query_vectors(
+    query_embedding: list[float],
+    top_k: int = 10,
+    filter_dict: dict | None = None,
+    include_metadata: bool = True,
+) -> list[dict]:
+    """
+    Query Pinecone for similar vectors.
+    
+    Args:
+        query_embedding: 1536-dim query vector
+        top_k: Number of results to return
+        filter_dict: Pinecone metadata filter (e.g., {"category": "faq"})
+        include_metadata: Whether to return metadata with results
+    
+    Returns:
+        List of matches with id, score, and metadata
+    """
+    idx = get_pinecone_index()
+    results = idx.query(
+        vector=query_embedding,
+        top_k=top_k,
+        filter=filter_dict,
+        include_metadata=include_metadata,
+    )
+    return [
+        {
+            "id": match.id,
+            "score": match.score,
+            "metadata": match.metadata if include_metadata else {},
+        }
+        for match in results.matches
+    ]
+
+
+def delete_vectors(ids: list[str]):
+    """Delete vectors by ID."""
+    idx = get_pinecone_index()
+    idx.delete(ids=ids)
+
+
+def delete_all_vectors():
+    """Delete all vectors in the index. Use with caution."""
+    idx = get_pinecone_index()
+    idx.delete(delete_all=True)
+
+========================================================================================================================
+FILE: app\core\redis.py
+========================================================================================================================
+"""
+Redis Client — Async Connection
+
+Provides:
+- Async Redis connection for pub/sub (nudge delivery)
+- Caching for frequent KB queries
+- Rate limiting support
+- Startup/shutdown lifecycle hooks
+
+Pattern reused from ResearchOS EventBus architecture.
+"""
+
+import redis.asyncio as aioredis
+
+from app.config import settings
+
+
+# --- Global Client ---
+redis_client: aioredis.Redis | None = None
+
+
+async def init_redis():
+    """Initialize Redis connection. Called on app startup."""
+    global redis_client
+    redis_client = aioredis.from_url(
+        settings.REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+        max_connections=20,
+    )
+    # Verify connection
+    await redis_client.ping()
+
+
+async def close_redis():
+    """Close Redis connection. Called on app shutdown."""
+    global redis_client
+    if redis_client:
+        await redis_client.close()
+
+
+def get_redis() -> aioredis.Redis:
+    """
+    Dependency that provides the Redis client.
+    Usage in routes:
+        async def my_route(redis: aioredis.Redis = Depends(get_redis)):
+    """
+    if redis_client is None:
+        raise RuntimeError("Redis not initialized. Call init_redis() first.")
+    return redis_client
+
+
+# --- Pub/Sub Helpers ---
+async def publish_nudge(call_id: str, nudge_data: dict):
+    """Publish a nudge to the call-specific channel."""
+    import json
+    channel = f"nudges:{call_id}"
+    await redis_client.publish(channel, json.dumps(nudge_data))
+
+
+async def subscribe_nudges(call_id: str):
+    """Subscribe to nudges for a specific call. Returns async generator."""
+    pubsub = redis_client.pubsub()
+    channel = f"nudges:{call_id}"
+    await pubsub.subscribe(channel)
+    try:
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                yield message["data"]
+    finally:
+        await pubsub.unsubscribe(channel)
+        await pubsub.close()
+
+
+# --- Caching Helpers ---
+async def cache_get(key: str) -> str | None:
+    """Get a cached value."""
+    return await redis_client.get(key)
+
+
+async def cache_set(key: str, value: str, ttl_seconds: int = 300):
+    """Set a cached value with TTL."""
+    await redis_client.setex(key, ttl_seconds, value)
+
+========================================================================================================================
+FILE: app\main.py
+========================================================================================================================
+"""
+Loan Operation Intelligence — FastAPI Application Factory
+
+Main entry point. Initializes the FastAPI app, registers routers,
+sets up middleware, and manages application lifecycle (startup/shutdown).
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifecycle: startup and shutdown hooks."""
+    # --- Startup ---
+    # Database — required
+    from app.core.database import init_db, close_db
+    await init_db()
+    logger.info("✅ PostgreSQL connected")
+
+    # Redis — required for nudges, optional otherwise
+    try:
+        from app.core.redis import init_redis, close_redis
+        await init_redis()
+        logger.info("✅ Redis connected")
+    except Exception as e:
+        logger.warning(f"⚠️  Redis unavailable: {e} — nudge streaming disabled")
+
+    # Pinecone — optional (RAG won't work without it)
+    try:
+        from app.core.pinecone_client import init_pinecone
+        init_pinecone()
+        logger.info("✅ Pinecone connected")
+    except Exception as e:
+        logger.warning(f"⚠️  Pinecone unavailable: {e} — RAG disabled")
+
+    # Langfuse — optional (observability)
+    try:
+        from app.core.langfuse_client import init_langfuse
+        init_langfuse()
+        logger.info("✅ Langfuse initialized")
+    except Exception as e:
+        logger.warning(f"⚠️  Langfuse unavailable: {e}")
+
+    logger.info("🚀 Loan Operation Intelligence started")
+
+    yield
+
+    # --- Shutdown ---
+    from app.core.database import close_db
+    await close_db()
+    try:
+        from app.core.redis import close_redis
+        await close_redis()
+    except Exception:
+        pass
+    logger.info("👋 Shutdown complete")
+
+
+def create_app() -> FastAPI:
+    """Factory function to create and configure the FastAPI application."""
+    from app.routes import voice, knowledge, calls, nudges, evaluation, health
+
+    app = FastAPI(
+        title="Loan Operation Intelligence",
+        description="AI platform for intelligent loan pre-due reminders with voice agents, knowledge base, and real-time nudges",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
+
+    # --- CORS Middleware ---
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.FRONTEND_URL, "http://localhost:3000"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # --- Register Routers ---
+    app.include_router(health.router, prefix="/api", tags=["Health"])
+    app.include_router(voice.router, prefix="/api/voice", tags=["Voice Agent"])
+    app.include_router(knowledge.router, prefix="/api/knowledge", tags=["Knowledge Base"])
+    app.include_router(calls.router, prefix="/api/calls", tags=["Calls"])
+    app.include_router(nudges.router, prefix="/api/nudges", tags=["Nudges"])
+    app.include_router(evaluation.router, prefix="/api/eval", tags=["Evaluation"])
+
+    return app
+
+
+app = create_app()
+
+========================================================================================================================
+FILE: app\models\__init__.py
+========================================================================================================================
+"""ORM Models Package — Exports all models for Alembic discovery."""
+
+from app.models.knowledge import KBRecord
+from app.models.call import Call, CallEvent
+from app.models.nudge import Nudge
+from app.models.business_rule import BusinessRule
+
+__all__ = ["KBRecord", "Call", "CallEvent", "Nudge", "BusinessRule"]
+
+========================================================================================================================
+FILE: app\models\business_rule.py
+========================================================================================================================
+"""
+Business Rule — ORM Model
+
+Declarative business rules for:
+- Escalation criteria (when to transfer to human)
+- Compliance requirements (disclosures that must be made)
+- Qualification logic (eligibility checks)
+- Payment rules (grace periods, late fees)
+
+Rules are evaluated by the RuleEngine service against conversation state.
+"""
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, func
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.database import Base
+
+
+class BusinessRule(Base):
+    __tablename__ = "business_rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    rule_id: Mapped[str] = mapped_column(
+        String(100), unique=True, nullable=False, index=True,
+        comment="Human-readable ID, e.g., rule_escalation_001"
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    category: Mapped[str] = mapped_column(
+        String(50), nullable=False, index=True,
+        comment="escalation | compliance | qualification | payment"
+    )
+    rule_type: Mapped[str] = mapped_column(
+        String(50), nullable=False,
+        comment="threshold | pattern | schedule | checklist"
+    )
+    condition: Mapped[dict] = mapped_column(
+        JSONB, nullable=False,
+        comment='Declarative condition, e.g., {"field": "objection_count", "operator": "gte", "value": 3}'
+    )
+    action: Mapped[dict] = mapped_column(
+        JSONB, nullable=False,
+        comment='Action to take, e.g., {"type": "escalate", "reason": "Multiple unresolved objections"}'
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, default=100,
+        comment="Higher priority = evaluated first"
+    )
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    market: Mapped[str] = mapped_column(
+        String(20), default="all",
+        comment="all | india | philippines | indonesia"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def __repr__(self):
+        return f"<BusinessRule {self.rule_id}: {self.name}>"
+
+========================================================================================================================
+FILE: app\models\call.py
+========================================================================================================================
+"""
+Call & CallEvent — ORM Models
+
+Call: Represents a voice call session with borrower details, outcome, and transcript.
+CallEvent: Event-sourced log of every state transition during a call (audit trail).
+"""
+
+import uuid
+from datetime import datetime, date
+from decimal import Decimal
+
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, Date, Numeric, ForeignKey, func
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.database import Base
+
+
+class Call(Base):
+    __tablename__ = "calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    external_call_id: Mapped[str | None] = mapped_column(
+        String(200), unique=True, nullable=True, index=True,
+        comment="Vapi call ID"
+    )
+    borrower_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    loan_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, index=True
+    )
+    loan_type: Mapped[str | None] = mapped_column(
+        String(50), nullable=True,
+        comment="personal | home | auto | business"
+    )
+    language: Mapped[str] = mapped_column(String(10), default="en")
+    status: Mapped[str] = mapped_column(
+        String(20), default="active",
+        comment="active | completed | escalated | failed"
+    )
+    outcome: Mapped[str | None] = mapped_column(
+        String(50), nullable=True,
+        comment="commitment | callback | escalation | refused | no_answer"
+    )
+    payment_due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    amount_due: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 2), nullable=True
+    )
+    commitment_date: Mapped[date | None] = mapped_column(
+        Date, nullable=True,
+        comment="Date borrower committed to pay"
+    )
+    callback_scheduled: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    transcript: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="Full conversation transcript as JSON"
+    )
+    summary: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="LLM-generated call summary"
+    )
+    sentiment_score: Mapped[float | None] = mapped_column(
+        Numeric(3, 2), nullable=True,
+        comment="Overall call sentiment (-1.0 to 1.0)"
+    )
+    metadata_: Mapped[dict | None] = mapped_column(
+        "metadata", JSONB, nullable=True,
+        comment="duration_seconds, agent_id, recording_url, etc."
+    )
+    market: Mapped[str] = mapped_column(
+        String(20), default="india",
+        comment="india | philippines | indonesia"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    # Relationships
+    events: Mapped[list["CallEvent"]] = relationship(
+        back_populates="call", cascade="all, delete-orphan"
+    )
+    nudges: Mapped[list["Nudge"]] = relationship(
+        "Nudge", back_populates="call", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self):
+        return f"<Call {self.external_call_id} status={self.status}>"
+
+
+class CallEvent(Base):
+    """
+    Event-sourced log of conversation state transitions.
+    Every tool call, state change, escalation, and error is recorded.
+    Enables full audit trail and conversation replay.
+    """
+    __tablename__ = "call_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    call_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("calls.id"), nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50), nullable=False,
+        comment="state_change | tool_call | rag_query | escalation | error | compliance_check"
+    )
+    from_state: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    to_state: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    # Relationships
+    call: Mapped["Call"] = relationship(back_populates="events")
+
+    def __repr__(self):
+        return f"<CallEvent {self.event_type}: {self.from_state} → {self.to_state}>"
+
+========================================================================================================================
+FILE: app\models\knowledge.py
+========================================================================================================================
+"""
+Knowledge Base Record — ORM Model
+
+Represents a single knowledge base record (chunk) with:
+- Content and PII-safe version
+- Category taxonomy (product, policy, faq, objection, compliance, payment, escalation)
+- Source tracking for citations
+- Versioning for content updates
+- Chunk-to-parent linking for document traceability
+- Embedding ID for Pinecone vector reference
+"""
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import String, Text, Boolean, Integer, DateTime, func
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.database import Base
+
+
+class KBRecord(Base):
+    __tablename__ = "kb_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    record_id: Mapped[str] = mapped_column(
+        String(100), unique=True, nullable=False, index=True,
+        comment="Human-readable ID, e.g., kb_loan_policy_001"
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_clean: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="PII-redacted version of content"
+    )
+    category: Mapped[str] = mapped_column(
+        String(50), nullable=False, index=True,
+        comment="product | policy | faq | objection | compliance | payment | escalation"
+    )
+    subcategory: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    source: Mapped[str] = mapped_column(
+        String(50), nullable=False,
+        comment="website | pdf | manual | csv"
+    )
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    version: Mapped[str] = mapped_column(String(20), default="1.0")
+    contains_pii: Mapped[bool] = mapped_column(Boolean, default=False)
+    metadata_: Mapped[dict | None] = mapped_column(
+        "metadata", JSONB, nullable=True,
+        comment="tags, language, product_type, applicable_market, etc."
+    )
+    chunk_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True,
+        comment="Chunk identifier within parent doc"
+    )
+    parent_doc_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Links chunk to parent document"
+    )
+    embedding_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True,
+        comment="Pinecone vector ID"
+    )
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    language: Mapped[str] = mapped_column(String(10), default="en")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def __repr__(self):
+        return f"<KBRecord {self.record_id}: {self.title[:50]}>"
+
+========================================================================================================================
+FILE: app\models\nudge.py
+========================================================================================================================
+"""
+Nudge — ORM Model
+
+Represents a real-time nudge generated during a live call.
+Tracks signal detection, nudge text, confidence, latency breakdown,
+and suppression status for false-positive analysis.
+"""
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import String, Text, Float, Boolean, Integer, DateTime, ForeignKey, func
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.database import Base
+
+
+class Nudge(Base):
+    __tablename__ = "nudges"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    call_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("calls.id"), nullable=False, index=True
+    )
+    signal_type: Mapped[str] = mapped_column(
+        String(50), nullable=False,
+        comment="compliance_gap | sentiment | cross_sell | missed_opportunity | payment_difficulty | risk"
+    )
+    signal_text: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="What was detected in the conversation"
+    )
+    nudge_text: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="Actionable recommendation for the agent"
+    )
+    confidence: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0,
+        comment="Confidence score 0.0 - 1.0"
+    )
+    priority: Mapped[str] = mapped_column(
+        String(20), default="medium",
+        comment="critical | high | medium | low"
+    )
+    displayed: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="Was this nudge shown to the agent"
+    )
+    suppressed: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="Was this nudge filtered out by controls"
+    )
+    suppression_reason: Mapped[str | None] = mapped_column(
+        String(100), nullable=True,
+        comment="duplicate | cooldown | low_confidence | max_per_call | expired"
+    )
+    latency_ms: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment='{"asr": 180, "signal": 95, "llm": 320, "delivery": 15, "total": 610}'
+    )
+    transcript_position: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+        comment="Word offset in transcript when signal was detected"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    # Relationships
+    call: Mapped["Call"] = relationship(back_populates="nudges")
+
+    def __repr__(self):
+        return f"<Nudge {self.signal_type} conf={self.confidence:.2f} {'[SUPPRESSED]' if self.suppressed else ''}>"
+
+========================================================================================================================
+FILE: app\routes\__init__.py
+========================================================================================================================
+"""Routes Package."""
+
+========================================================================================================================
+FILE: app\routes\calls.py
+========================================================================================================================
+"""
+Call Management Routes
+
+Endpoints for viewing and managing call records:
+- GET /calls — List calls with pagination and filtering
+- GET /calls/{call_id} — Get call details with events and nudges
+- GET /calls/{call_id}/transcript — Get full transcript
+- GET /calls/{call_id}/events — Get call event timeline
+- GET /calls/analytics — Call analytics summary
+"""
+
+import logging
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.schemas.call import CallResponse, CallListResponse, CallEventResponse
+from app.services.call_service import CallService
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.get("/", response_model=CallListResponse)
+async def list_calls(
+    status: str | None = Query(None),
+    outcome: str | None = Query(None),
+    market: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """List calls with optional filtering and pagination."""
+    service = CallService(db)
+    return await service.list_calls(
+        status=status, outcome=outcome, market=market,
+        page=page, page_size=page_size,
+    )
+
+
+@router.get("/{call_id}", response_model=CallResponse)
+async def get_call(
+    call_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get full call details including event and nudge counts."""
+    service = CallService(db)
+    call = await service.get_call(call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return call
+
+
+@router.get("/{call_id}/transcript")
+async def get_transcript(
+    call_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the full conversation transcript for a call."""
+    service = CallService(db)
+    transcript = await service.get_transcript(call_id)
+    if transcript is None:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    return {"call_id": call_id, "transcript": transcript}
+
+
+@router.get("/{call_id}/events")
+async def get_call_events(
+    call_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the event timeline for a call (state changes, tool calls, etc.)."""
+    service = CallService(db)
+    events = await service.get_events(call_id)
+    return {"call_id": call_id, "events": events}
+
+
+@router.get("/analytics/summary")
+async def call_analytics(
+    market: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Call analytics summary:
+    - Total calls, completion rate, outcome breakdown
+    - Average duration, sentiment distribution
+    - Escalation rate, commitment rate
+    """
+    service = CallService(db)
+    return await service.get_analytics(market=market)
+
+========================================================================================================================
+FILE: app\routes\evaluation.py
+========================================================================================================================
+"""
+Evaluation Routes (Assessment Deliverable)
+
+Endpoints for running and viewing evaluation results:
+- POST /run — Run evaluation suite (RAG, voice, nudge, multilingual)
+- GET /results — List evaluation results
+- GET /results/{eval_type} — Get results for a specific eval type
+"""
+
+import json
+import logging
+import os
+import time
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.services.rag_service import RAGService
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# Path to test cases
+TEST_CASES_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+    "evaluation", "test_cases",
+)
+
+
+@router.post("/run")
+async def run_evaluation(
+    eval_type: str = Query(
+        "all", description="all | rag_retrieval | voice_flow | nudge_quality | latency"
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Run evaluation suite.
+    
+    Eval types:
+    - rag_retrieval: 5+ test queries against KB with verdicts
+    - voice_flow: Test call scenario validation
+    - nudge_quality: False positive analysis
+    - latency: P50/P95 latency measurements
+    - all: Run all evaluations
+    """
+    results = {}
+
+    if eval_type in ("all", "rag_retrieval"):
+        results["rag_retrieval"] = await _run_rag_retrieval(db)
+
+    if eval_type in ("all", "nudge_quality"):
+        results["nudge_quality"] = await _run_nudge_quality(db)
+
+    if eval_type in ("all", "voice_flow"):
+        results["voice_flow"] = _load_voice_scenarios()
+
+    if eval_type in ("all", "latency"):
+        results["latency"] = {"status": "requires_audio_file", "message": "Run `make simulate` with test audio to generate latency data."}
+
+    return {"eval_type": eval_type, "results": results}
+
+
+@router.get("/results")
+async def list_results(
+    eval_type: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """List evaluation results with optional type filter."""
+    # Load results from saved files if available
+    results_dir = os.path.join(
+        os.path.dirname(TEST_CASES_DIR), "results"
+    )
+    available = []
+    if os.path.exists(results_dir):
+        for f in os.listdir(results_dir):
+            if f.endswith(".json") and (eval_type is None or eval_type in f):
+                available.append(f)
+    return {"available_results": available, "total": len(available)}
+
+
+@router.get("/results/{eval_type}")
+async def get_results_by_type(
+    eval_type: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get detailed evaluation results for a specific type."""
+    results_file = os.path.join(
+        os.path.dirname(TEST_CASES_DIR), "results", f"{eval_type}.json"
+    )
+    if os.path.exists(results_file):
+        with open(results_file, "r") as f:
+            return json.load(f)
+    return {"eval_type": eval_type, "results": [], "summary": {}, "status": "not_run"}
+
+
+# --- Internal evaluation runners ---
+
+async def _run_rag_retrieval(db: AsyncSession) -> dict:
+    """
+    Q2 Evaluation: RAG Retrieval Test
+    
+    Runs 7 predefined queries, evaluates results against expected keywords,
+    generates verdicts (correct | partially_correct | incorrect).
+    """
+    test_cases_path = os.path.join(TEST_CASES_DIR, "rag_retrieval.json")
+    if not os.path.exists(test_cases_path):
+        return {"error": "Test cases file not found", "path": test_cases_path}
+
+    with open(test_cases_path, "r") as f:
+        test_cases = json.load(f)
+
+    rag = RAGService(db)
+    results = []
+    verdicts = {"correct": 0, "partially_correct": 0, "incorrect": 0, "error": 0}
+    total_retrieval_time = 0
+
+    for tc in test_cases:
+        try:
+            start = time.time()
+            search_result = await rag.search(
+                query=tc["query"],
+                category=tc.get("expected_category"),
+                top_k=3,
+            )
+            elapsed_ms = (time.time() - start) * 1000
+            total_retrieval_time += elapsed_ms
+
+            # Evaluate: check if expected keywords appear in results
+            result_text = " ".join(
+                r.get("content", "") + " " + r.get("title", "")
+                for r in search_result.get("results", [])
+            ).lower()
+
+            expected_keywords = tc.get("expected_keywords", [])
+            matched = [kw for kw in expected_keywords if kw.lower() in result_text]
+            match_ratio = len(matched) / len(expected_keywords) if expected_keywords else 0
+
+            # Determine verdict
+            if match_ratio >= 0.6:
+                verdict = "correct"
+            elif match_ratio >= 0.3:
+                verdict = "partially_correct"
+            else:
+                verdict = "incorrect"
+
+            verdicts[verdict] += 1
+
+            top_result = search_result["results"][0] if search_result.get("results") else None
+
+            results.append({
+                "test_id": tc["test_id"],
+                "query": tc["query"],
+                "description": tc.get("description", ""),
+                "expected_category": tc.get("expected_category"),
+                "expected_keywords": expected_keywords,
+                "matched_keywords": matched,
+                "match_ratio": round(match_ratio, 2),
+                "verdict": verdict,
+                "top_result": {
+                    "record_id": top_result["record_id"] if top_result else None,
+                    "title": top_result["title"] if top_result else None,
+                    "relevance_score": top_result["relevance_score"] if top_result else None,
+                    "source": top_result["source"] if top_result else None,
+                    "content_preview": top_result["content"][:200] if top_result else None,
+                } if top_result else None,
+                "total_results": search_result.get("total", 0),
+                "retrieval_time_ms": round(elapsed_ms, 2),
+            })
+
+        except Exception as e:
+            verdicts["error"] += 1
+            results.append({
+                "test_id": tc["test_id"],
+                "query": tc["query"],
+                "verdict": "error",
+                "error": str(e),
+            })
+
+    total_tests = len(test_cases)
+    accuracy = verdicts["correct"] / total_tests if total_tests else 0
+
+    summary = {
+        "total_tests": total_tests,
+        "verdicts": verdicts,
+        "accuracy": round(accuracy, 2),
+        "partial_or_better": round(
+            (verdicts["correct"] + verdicts["partially_correct"]) / total_tests, 2
+        ) if total_tests else 0,
+        "avg_retrieval_time_ms": round(total_retrieval_time / total_tests, 2) if total_tests else 0,
+    }
+
+    # Save results to file
+    output = {"summary": summary, "results": results}
+    _save_results("rag_retrieval", output)
+
+    return output
+
+
+async def _run_nudge_quality(db: AsyncSession) -> dict:
+    """
+    Q4 Evaluation: Nudge quality test using transcript scenarios.
+    
+    Runs signal extraction on predefined transcript segments,
+    checks if expected signals are detected, measures false positives.
+    """
+    test_cases_path = os.path.join(TEST_CASES_DIR, "nudge_scenarios.json")
+    if not os.path.exists(test_cases_path):
+        return {"error": "Test cases file not found"}
+
+    with open(test_cases_path, "r") as f:
+        test_cases = json.load(f)
+
+    from app.services.signal_extractor import SignalExtractor
+    extractor = SignalExtractor()
+
+    results = []
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+    true_negatives = 0
+
+    for tc in test_cases:
+        try:
+            start = time.time()
+            signals = await extractor.extract(
+                transcript=tc["transcript_segment"],
+                new_segment=tc["transcript_segment"],
+            )
+            elapsed_ms = (time.time() - start) * 1000
+
+            expected_signal = tc.get("expected_signal")
+            detected_types = [s.get("type") for s in signals]
+
+            if expected_signal is None:
+                # Should detect NO signals (negative case)
+                if not signals:
+                    verdict = "true_negative"
+                    true_negatives += 1
+                else:
+                    verdict = "false_positive"
+                    false_positives += 1
+            else:
+                # Should detect the expected signal
+                if expected_signal in detected_types:
+                    verdict = "true_positive"
+                    true_positives += 1
+                else:
+                    verdict = "false_negative"
+                    false_negatives += 1
+
+            results.append({
+                "test_id": tc["test_id"],
+                "scenario": tc["scenario"],
+                "expected_signal": expected_signal,
+                "detected_signals": signals,
+                "verdict": verdict,
+                "latency_ms": round(elapsed_ms, 2),
+            })
+
+        except Exception as e:
+            results.append({
+                "test_id": tc["test_id"],
+                "scenario": tc["scenario"],
+                "verdict": "error",
+                "error": str(e),
+            })
+
+    total = true_positives + false_positives + false_negatives + true_negatives
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) else 0
+
+    summary = {
+        "total_tests": len(test_cases),
+        "true_positives": true_positives,
+        "false_positives": false_positives,
+        "false_negatives": false_negatives,
+        "true_negatives": true_negatives,
+        "precision": round(precision, 3),
+        "recall": round(recall, 3),
+        "f1_score": round(f1, 3),
+        "false_positive_rate": round(false_positives / total, 3) if total else 0,
+    }
+
+    output = {"summary": summary, "results": results}
+    _save_results("nudge_quality", output)
+    return output
+
+
+def _load_voice_scenarios() -> dict:
+    """Load voice test scenarios as evaluation reference."""
+    test_cases_path = os.path.join(TEST_CASES_DIR, "voice_scenarios.json")
+    if not os.path.exists(test_cases_path):
+        return {"error": "Test cases file not found"}
+
+    with open(test_cases_path, "r") as f:
+        scenarios = json.load(f)
+
+    return {
+        "total_scenarios": len(scenarios),
+        "scenarios": scenarios,
+        "note": "Voice scenarios require live Vapi call testing. Use /api/voice/outbound-call to trigger test calls.",
+    }
+
+
+def _save_results(eval_type: str, data: dict):
+    """Save evaluation results to file."""
+    results_dir = os.path.join(os.path.dirname(TEST_CASES_DIR), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    filepath = os.path.join(results_dir, f"{eval_type}.json")
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+    logger.info(f"Saved {eval_type} results to {filepath}")
+
+========================================================================================================================
+FILE: app\routes\health.py
+========================================================================================================================
+"""
+Health Check Route
+
+Simple health check and readiness probe.
+"""
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+
+from app.core.database import get_db
+from app.core.redis import get_redis
+
+router = APIRouter()
+
+
+@router.get("/health")
+async def health_check():
+    """Basic liveness probe."""
+    return {"status": "healthy", "service": "loan-operation-intelligence"}
+
+
+@router.get("/health/ready")
+async def readiness_check(db: AsyncSession = Depends(get_db)):
+    """
+    Readiness probe — checks all infrastructure dependencies.
+    Returns 200 only if PostgreSQL, Redis, and Pinecone are reachable.
+    """
+    checks = {}
+
+    # PostgreSQL
+    try:
+        await db.execute(text("SELECT 1"))
+        checks["postgres"] = "ok"
+    except Exception as e:
+        checks["postgres"] = f"error: {str(e)}"
+
+    # Redis
+    try:
+        redis = get_redis()
+        await redis.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"error: {str(e)}"
+
+    # Pinecone
+    try:
+        from app.core.pinecone_client import get_pinecone_index
+        idx = get_pinecone_index()
+        stats = idx.describe_index_stats()
+        checks["pinecone"] = f"ok (vectors: {stats.total_vector_count})"
+    except Exception as e:
+        checks["pinecone"] = f"error: {str(e)}"
+
+    all_ok = all("ok" in v for v in checks.values())
+    return {
+        "status": "ready" if all_ok else "degraded",
+        "checks": checks,
+    }
+
+========================================================================================================================
+FILE: app\routes\knowledge.py
+========================================================================================================================
+"""
+Knowledge Base Routes (Q2)
+
+CRUD and search endpoints for the knowledge base:
+- POST /ingest — Bulk ingest KB records (parse, clean, chunk, embed, store)
+- GET /search — RAG search with metadata filtering
+- GET /records — List all records with pagination
+- GET /records/{record_id} — Get a single record
+- PUT /records/{record_id} — Update a record
+- DELETE /records/{record_id} — Delete a record
+- GET /retrieval-test — Run the 5+ retrieval test queries
+"""
+
+import logging
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.schemas.knowledge import (
+    KBRecordCreate, KBRecordUpdate, KBRecordResponse,
+    KBSearchRequest, KBSearchResponse, KBIngestRequest,
+    KBRetrievalTest,
+)
+from app.services.knowledge_service import KnowledgeService
+from app.services.rag_service import RAGService
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.post("/ingest")
+async def ingest_records(
+    request: KBIngestRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Bulk ingest KB records.
+    
+    Pipeline: validate → PII detect → chunk → embed → store in Postgres + Pinecone
+    """
+    service = KnowledgeService(db)
+    result = await service.ingest_records(
+        records=request.records,
+        embed=request.embed,
+        detect_pii_flag=request.detect_pii,
+    )
+    return result
+
+
+@router.post("/search", response_model=KBSearchResponse)
+async def search_knowledge_base(
+    request: KBSearchRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Search the knowledge base using RAG.
+    
+    Pipeline: embed query → Pinecone similarity search → metadata filter → rerank → return with citations
+    """
+    rag_service = RAGService(db)
+    results = await rag_service.search(
+        query=request.query,
+        category=request.category,
+        product_type=request.product_type,
+        language=request.language,
+        market=request.market,
+        top_k=request.top_k,
+    )
+    return results
+
+
+@router.get("/records")
+async def list_records(
+    category: str | None = Query(None),
+    language: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """List KB records with optional filtering and pagination."""
+    service = KnowledgeService(db)
+    return await service.list_records(
+        category=category,
+        language=language,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/records/{record_id}", response_model=KBRecordResponse)
+async def get_record(
+    record_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a single KB record by record_id."""
+    service = KnowledgeService(db)
+    record = await service.get_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return record
+
+
+@router.put("/records/{record_id}", response_model=KBRecordResponse)
+async def update_record(
+    record_id: str,
+    update: KBRecordUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a KB record and re-embed if content changed."""
+    service = KnowledgeService(db)
+    record = await service.update_record(record_id, update)
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return record
+
+
+@router.delete("/records/{record_id}")
+async def delete_record(
+    record_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a KB record and its vector from Pinecone."""
+    service = KnowledgeService(db)
+    await service.delete_record(record_id)
+    return {"status": "deleted", "record_id": record_id}
+
+
+@router.get("/retrieval-test")
+async def run_retrieval_test(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Run the Q2 retrieval test: 5+ queries with verdicts.
+    
+    Returns: query, retrieved chunk, source reference, 
+    relevance explanation, and verdict for each test case.
+    """
+    rag_service = RAGService(db)
+    results = await rag_service.run_retrieval_test()
+    return results
+
+
+@router.get("/stats")
+async def kb_stats(
+    db: AsyncSession = Depends(get_db),
+):
+    """Get knowledge base statistics (record count, category breakdown, etc.)."""
+    service = KnowledgeService(db)
+    return await service.get_stats()
+
+========================================================================================================================
+FILE: app\routes\nudges.py
+========================================================================================================================
+"""
+Nudge Routes — Real-time Nudge Streaming (Q4)
+
+Endpoints for the live nudge system:
+- GET /stream/{call_id} — SSE stream of real-time nudges for a call
+- POST /session/start — Start a nudge processing session (live or simulated)
+- POST /session/stop — Stop a nudge session
+- GET /analysis/{call_id} — Nudge quality analysis for a call
+- GET /latency-report — P50/P95 latency report across all calls
+"""
+
+import logging
+import json
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.redis import subscribe_nudges
+from app.schemas.nudge import (
+    NudgeResponse, NudgeAnalysis, StartNudgeSessionRequest, LatencyReport,
+)
+from app.services.nudge_engine import NudgeEngine
+from app.services.call_service import CallService
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.get("/stream/{call_id}")
+async def stream_nudges(call_id: str):
+    """
+    SSE endpoint for real-time nudge delivery.
+    
+    Subscribes to Redis pub/sub channel for the given call_id
+    and streams nudges as Server-Sent Events.
+    
+    Frontend connects via EventSource:
+        const es = new EventSource(`/api/nudges/stream/${callId}`);
+        es.onmessage = (e) => { const nudge = JSON.parse(e.data); ... };
+    """
+    async def event_generator():
+        async for nudge_data in subscribe_nudges(call_id):
+            yield f"data: {nudge_data}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/session/start")
+async def start_nudge_session(
+    request: StartNudgeSessionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Start a real-time nudge processing session.
+    
+    For live calls: hooks into Vapi's real-time transcript stream.
+    For simulation: replays audio file at real-time speed through Deepgram.
+    
+    The nudge engine processes the stream and publishes nudges
+    to the Redis channel for the call_id.
+    """
+    engine = NudgeEngine(db)
+    session_id = await engine.start_session(
+        call_id=request.call_id,
+        audio_source=request.audio_source,
+        chunk_ms=request.chunk_ms,
+    )
+    return {"session_id": session_id, "call_id": request.call_id, "status": "started"}
+
+
+@router.post("/session/stop")
+async def stop_nudge_session(
+    call_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stop an active nudge processing session."""
+    engine = NudgeEngine(db)
+    await engine.stop_session(call_id)
+    return {"call_id": call_id, "status": "stopped"}
+
+
+@router.get("/analysis/{call_id}", response_model=NudgeAnalysis)
+async def nudge_analysis(
+    call_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Nudge quality analysis for a specific call.
+    
+    Returns: total/delivered/suppressed counts, suppression breakdown,
+    avg confidence, avg/P50/P95 latency, signal type breakdown,
+    and false positive estimate.
+    """
+    engine = NudgeEngine(db)
+    analysis = await engine.analyze_call(call_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="No nudges found for call")
+    return analysis
+
+
+@router.get("/latency-report", response_model=LatencyReport)
+async def latency_report(
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Aggregate latency report across all calls (Q4 deliverable).
+    
+    Reports P50/P95 for each pipeline component:
+    ASR → signal extraction → LLM nudge generation → delivery
+    """
+    engine = NudgeEngine(db)
+    return await engine.generate_latency_report()
+
+========================================================================================================================
+FILE: app\routes\voice.py
+========================================================================================================================
+"""
+Voice Agent Routes — Vapi Webhook Handlers (Q1)
+
+Handles all Vapi.ai webhook events:
+- POST /webhook — Main webhook endpoint (function-call, status-update, end-of-call-report)
+- POST /webhook/assistant-request — Dynamic assistant configuration
+
+Each function-call from Vapi routes to the appropriate service:
+- search_knowledge_base → RAG Service
+- lookup_borrower → Mock CRM / Call Service
+- schedule_callback → Call Service
+- record_payment_commitment → Call Service
+- escalate_to_human → Call Service
+- check_eligibility → Rule Engine
+"""
+
+import logging
+from fastapi import APIRouter, Request, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.services.voice_service import VoiceService
+from app.services.rag_service import RAGService
+from app.services.rule_engine import RuleEngine
+from app.services.call_service import CallService
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.post("/webhook")
+async def vapi_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Main Vapi webhook endpoint.
+    
+    Receives all webhook events from Vapi and routes them:
+    - function-call → tool execution → return result to Vapi
+    - status-update → update call status in DB
+    - end-of-call-report → save transcript, generate summary, log to Langfuse
+    """
+    payload = await request.json()
+    message = payload.get("message", payload)
+    message_type = message.get("type", "")
+
+    logger.info(f"Vapi webhook received: {message_type}")
+
+    voice_service = VoiceService(db)
+
+    if message_type == "function-call":
+        return await voice_service.handle_function_call(message)
+
+    elif message_type == "status-update":
+        await voice_service.handle_status_update(message)
+        return {"status": "ok"}
+
+    elif message_type == "end-of-call-report":
+        await voice_service.handle_end_of_call(message)
+        return {"status": "ok"}
+
+    elif message_type == "assistant-request":
+        return await voice_service.handle_assistant_request(message)
+
+    elif message_type == "hang":
+        # Vapi sends this as a keepalive ping
+        return {"status": "ok"}
+
+    else:
+        logger.warning(f"Unknown Vapi webhook type: {message_type}")
+        return {"status": "ok"}
+
+
+@router.post("/outbound-call")
+async def trigger_outbound_call(
+    loan_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger an outbound pre-due reminder call via Vapi.
+    
+    Looks up borrower by loan_id, creates a call record,
+    and initiates the call through Vapi API.
+    """
+    voice_service = VoiceService(db)
+    result = await voice_service.trigger_outbound_call(loan_id)
+    return result
+
+========================================================================================================================
+FILE: app\schemas\__init__.py
+========================================================================================================================
+"""Pydantic Schemas Package."""
+
+========================================================================================================================
+FILE: app\schemas\call.py
+========================================================================================================================
+"""
+Call Schemas — Pydantic Models
+
+Request/response schemas for call management endpoints.
+"""
+
+from datetime import datetime, date
+from decimal import Decimal
+from pydantic import BaseModel, Field
+
+
+class CallCreate(BaseModel):
+    """Schema for creating a new call record."""
+    external_call_id: str | None = None
+    borrower_name: str | None = None
+    loan_id: str | None = None
+    loan_type: str | None = None
+    language: str = "en"
+    payment_due_date: date | None = None
+    amount_due: Decimal | None = None
+    market: str = "india"
+
+
+class CallUpdate(BaseModel):
+    """Schema for updating a call record."""
+    status: str | None = None
+    outcome: str | None = None
+    commitment_date: date | None = None
+    callback_scheduled: datetime | None = None
+    transcript: dict | None = None
+    summary: str | None = None
+    sentiment_score: float | None = None
+    metadata: dict | None = None
+
+
+class CallResponse(BaseModel):
+    """Schema for a call response."""
+    id: str
+    external_call_id: str | None
+    borrower_name: str | None
+    loan_id: str | None
+    loan_type: str | None
+    language: str
+    status: str
+    outcome: str | None
+    payment_due_date: date | None
+    amount_due: Decimal | None
+    commitment_date: date | None
+    callback_scheduled: datetime | None
+    summary: str | None
+    sentiment_score: float | None
+    market: str
+    created_at: datetime
+    updated_at: datetime
+    event_count: int | None = None
+    nudge_count: int | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class CallEventResponse(BaseModel):
+    """Schema for a call event."""
+    id: str
+    event_type: str
+    from_state: str | None
+    to_state: str | None
+    payload: dict | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class CallListResponse(BaseModel):
+    """Schema for paginated call list."""
+    calls: list[CallResponse]
+    total: int
+    page: int
+    page_size: int
+
+========================================================================================================================
+FILE: app\schemas\knowledge.py
+========================================================================================================================
+"""
+Knowledge Base Schemas — Pydantic Models
+
+Request/response schemas for KB CRUD, search, and ingestion endpoints.
+"""
+
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+
+# --- Request Schemas ---
+class KBRecordCreate(BaseModel):
+    """Schema for creating a new KB record."""
+    record_id: str = Field(..., description="Human-readable ID, e.g., kb_loan_policy_001")
+    title: str = Field(..., max_length=500)
+    content: str
+    category: str = Field(..., description="product | policy | faq | objection | compliance | payment | escalation")
+    subcategory: str | None = None
+    source: str = Field(..., description="website | pdf | manual | csv")
+    source_url: str | None = None
+    version: str = "1.0"
+    metadata: dict | None = None
+    language: str = "en"
+
+
+class KBRecordUpdate(BaseModel):
+    """Schema for updating a KB record."""
+    title: str | None = None
+    content: str | None = None
+    category: str | None = None
+    subcategory: str | None = None
+    metadata: dict | None = None
+    version: str | None = None
+
+
+class KBSearchRequest(BaseModel):
+    """Schema for searching the knowledge base."""
+    query: str = Field(..., min_length=3, description="Search query text")
+    category: str | None = Field(None, description="Filter by category")
+    product_type: str | None = Field(None, description="Filter by product type")
+    language: str | None = Field(None, description="Filter by language")
+    market: str | None = Field(None, description="Filter by market")
+    top_k: int = Field(5, ge=1, le=20, description="Number of results to return")
+
+
+class KBIngestRequest(BaseModel):
+    """Schema for ingesting a batch of KB records."""
+    records: list[KBRecordCreate]
+    embed: bool = Field(True, description="Whether to generate embeddings")
+    detect_pii: bool = Field(True, description="Whether to run PII detection")
+
+
+# --- Response Schemas ---
+class KBRecordResponse(BaseModel):
+    """Schema for a KB record response."""
+    id: str
+    record_id: str
+    title: str
+    content: str
+    content_clean: str | None
+    category: str
+    subcategory: str | None
+    source: str
+    source_url: str | None
+    version: str
+    contains_pii: bool
+    metadata: dict | None
+    chunk_id: str | None
+    parent_doc_id: str | None
+    token_count: int | None
+    language: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class KBSearchResult(BaseModel):
+    """Schema for a single search result."""
+    record_id: str
+    title: str
+    content: str
+    category: str
+    source: str
+    source_url: str | None
+    relevance_score: float = Field(..., description="Cosine similarity score")
+    metadata: dict | None
+
+
+class KBSearchResponse(BaseModel):
+    """Schema for search results."""
+    query: str
+    results: list[KBSearchResult]
+    total: int
+    retrieval_time_ms: float
+
+
+class KBRetrievalTest(BaseModel):
+    """Schema for a KB retrieval test result (Q2 evaluation)."""
+    query: str
+    retrieved_record: KBSearchResult
+    source_reference: str
+    relevance_explanation: str
+    verdict: str = Field(..., description="correct | partially_correct | incorrect")
+
+========================================================================================================================
+FILE: app\schemas\nudge.py
+========================================================================================================================
+"""
+Nudge Schemas — Pydantic Models
+
+Request/response schemas for nudge streaming and analysis endpoints.
+"""
+
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+
+class NudgeResponse(BaseModel):
+    """Schema for a nudge delivered via SSE/WebSocket."""
+    id: str
+    call_id: str
+    signal_type: str
+    signal_text: str
+    nudge_text: str
+    confidence: float
+    priority: str
+    latency_ms: dict | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class NudgeAnalysis(BaseModel):
+    """Schema for nudge quality analysis."""
+    call_id: str
+    total_nudges: int
+    delivered_nudges: int
+    suppressed_nudges: int
+    suppression_breakdown: dict = Field(
+        default_factory=dict,
+        description='{"duplicate": 2, "cooldown": 1, "low_confidence": 3}'
+    )
+    avg_confidence: float
+    avg_latency_ms: dict = Field(
+        default_factory=dict,
+        description='{"asr": 180, "signal": 95, "llm": 320, "delivery": 15, "total": 610}'
+    )
+    p50_latency_ms: float
+    p95_latency_ms: float
+    signal_type_breakdown: dict = Field(
+        default_factory=dict,
+        description='{"compliance_gap": 2, "sentiment": 1, ...}'
+    )
+    false_positive_estimate: float = Field(
+        0.0, description="Estimated false positive rate (0.0 - 1.0)"
+    )
+
+
+class StartNudgeSessionRequest(BaseModel):
+    """Schema for starting a real-time nudge session."""
+    call_id: str
+    audio_source: str = Field(
+        ..., description="live | file_path to audio for simulation"
+    )
+    chunk_ms: int = Field(250, description="Audio chunk size in milliseconds")
+
+
+class LatencyReport(BaseModel):
+    """Schema for the Q4 latency report."""
+    total_calls_analyzed: int
+    total_nudges_generated: int
+    total_nudges_delivered: int
+    total_nudges_suppressed: int
+    component_latency: dict = Field(
+        description="Per-component P50/P95 latency in ms"
+    )
+    end_to_end_latency: dict = Field(
+        description='{"p50": 610, "p95": 890}'
+    )
+    signal_type_accuracy: dict = Field(
+        description="Per signal type: delivered vs false positive"
+    )
+
+========================================================================================================================
+FILE: app\schemas\voice.py
+========================================================================================================================
+"""
+Voice / Vapi Schemas — Pydantic Models
+
+Schemas for Vapi.ai webhook payloads:
+- function-call: When the LLM calls a tool
+- status-update: Call status changes
+- end-of-call-report: Post-call analytics
+- assistant-request: Dynamic assistant configuration
+
+Reference: https://docs.vapi.ai/server-url
+"""
+
+from pydantic import BaseModel, Field
+
+
+# --- Vapi Webhook Payloads ---
+class VapiMessage(BaseModel):
+    """Base schema for all Vapi webhook messages."""
+    message: dict = Field(..., description="The Vapi webhook payload")
+
+
+class VapiFunctionCallPayload(BaseModel):
+    """Schema for Vapi function-call webhook."""
+    type: str = "function-call"
+    function_call: dict = Field(
+        ..., description='{"name": "search_knowledge_base", "parameters": {"query": "..."}}'
+    )
+    call: dict = Field(
+        default_factory=dict,
+        description="Call metadata including call ID"
+    )
+
+
+class VapiStatusUpdate(BaseModel):
+    """Schema for Vapi status-update webhook."""
+    type: str = "status-update"
+    status: str = Field(..., description="in-progress | forwarding | ended")
+    call: dict = Field(default_factory=dict)
+    messages: list[dict] = Field(default_factory=list)
+    ended_reason: str | None = None
+    transcript: str | None = None
+
+
+class VapiEndOfCallReport(BaseModel):
+    """Schema for Vapi end-of-call-report webhook."""
+    type: str = "end-of-call-report"
+    call: dict = Field(default_factory=dict)
+    ended_reason: str | None = None
+    transcript: str | None = None
+    messages: list[dict] = Field(default_factory=list)
+    summary: str | None = None
+    recording_url: str | None = None
+    stereo_recording_url: str | None = None
+    duration_seconds: float | None = None
+    cost: float | None = None
+
+
+class VapiAssistantRequest(BaseModel):
+    """Schema for Vapi assistant-request webhook (dynamic configuration)."""
+    type: str = "assistant-request"
+    call: dict = Field(default_factory=dict)
+    phone_number: dict | None = None
+
+
+# --- Tool Response Schemas ---
+class ToolCallResult(BaseModel):
+    """Schema for a tool call result returned to Vapi."""
+    result: str = Field(..., description="The tool call result as a string for the LLM")
+
+
+class KBSearchToolResult(BaseModel):
+    """Schema for knowledge base search tool result."""
+    found: bool
+    answer: str
+    sources: list[dict] = Field(
+        default_factory=list,
+        description='[{"record_id": "kb_001", "title": "...", "source": "website"}]'
+    )
+    confidence: float = 0.0
+
+
+class BorrowerLookupResult(BaseModel):
+    """Schema for borrower lookup tool result."""
+    found: bool
+    borrower_name: str | None = None
+    loan_id: str | None = None
+    loan_type: str | None = None
+    amount_due: float | None = None
+    due_date: str | None = None
+    days_until_due: int | None = None
+    payment_history: str | None = None
+    eligible_programs: list[str] = Field(default_factory=list)
+
+========================================================================================================================
+FILE: app\services\__init__.py
+========================================================================================================================
+"""Services Package — Business Logic Layer."""
+
+========================================================================================================================
+FILE: app\services\call_service.py
+========================================================================================================================
+"""
+Call Service — Call Lifecycle Management
+
+Handles:
+- Creating and updating call records
+- Logging call events (state transitions, tool calls)
+- Retrieving transcripts and event timelines
+- Call analytics
+"""
+
+import uuid
+import logging
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, update
+
+from app.models.call import Call, CallEvent
+
+logger = logging.getLogger(__name__)
+
+
+class CallService:
+    """
+    Call lifecycle management service.
+    
+    Usage:
+        service = CallService(db)
+        await service.create_or_update_call(external_call_id="vapi_123", status="active")
+    """
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def create_or_update_call(
+        self,
+        external_call_id: str,
+        status: str | None = None,
+        transcript: dict | None = None,
+        summary: str | None = None,
+        metadata: dict | None = None,
+        **kwargs,
+    ) -> Call:
+        """Create a new call record or update an existing one."""
+        result = await self.db.execute(
+            select(Call).where(Call.external_call_id == external_call_id)
+        )
+        call = result.scalar_one_or_none()
+
+        if call is None:
+            call = Call(
+                id=uuid.uuid4(),
+                external_call_id=external_call_id,
+                status=status or "active",
+                **kwargs,
+            )
+            self.db.add(call)
+        else:
+            if status:
+                call.status = status
+            if transcript:
+                call.transcript = transcript
+            if summary:
+                call.summary = summary
+            if metadata:
+                existing = call.metadata_ or {}
+                existing.update(metadata)
+                call.metadata_ = existing
+
+        await self.db.flush()
+        return call
+
+    async def log_event(
+        self,
+        call_id: str,
+        event_type: str,
+        from_state: str | None = None,
+        to_state: str | None = None,
+        payload: dict | None = None,
+    ):
+        """Log a call event for audit trail."""
+        # Find call by external_call_id
+        result = await self.db.execute(
+            select(Call).where(Call.external_call_id == call_id)
+        )
+        call = result.scalar_one_or_none()
+
+        if call:
+            event = CallEvent(
+                id=uuid.uuid4(),
+                call_id=call.id,
+                event_type=event_type,
+                from_state=from_state,
+                to_state=to_state,
+                payload=payload,
+            )
+            self.db.add(event)
+            await self.db.flush()
+
+    async def get_call(self, call_id: str) -> Call | None:
+        """Get call by ID or external_call_id."""
+        result = await self.db.execute(
+            select(Call).where(
+                (Call.external_call_id == call_id) | (Call.id == call_id)
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_transcript(self, call_id: str) -> dict | None:
+        """Get call transcript."""
+        call = await self.get_call(call_id)
+        return call.transcript if call else None
+
+    async def get_events(self, call_id: str) -> list[dict]:
+        """Get call events timeline."""
+        call = await self.get_call(call_id)
+        if not call:
+            return []
+
+        result = await self.db.execute(
+            select(CallEvent)
+            .where(CallEvent.call_id == call.id)
+            .order_by(CallEvent.created_at.asc())
+        )
+        events = result.scalars().all()
+        return [
+            {
+                "id": str(e.id),
+                "event_type": e.event_type,
+                "from_state": e.from_state,
+                "to_state": e.to_state,
+                "payload": e.payload,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in events
+        ]
+
+    async def list_calls(
+        self,
+        status: str | None = None,
+        outcome: str | None = None,
+        market: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        """List calls with optional filtering and pagination."""
+        query = select(Call)
+        count_query = select(func.count(Call.id))
+
+        if status:
+            query = query.where(Call.status == status)
+            count_query = count_query.where(Call.status == status)
+        if outcome:
+            query = query.where(Call.outcome == outcome)
+            count_query = count_query.where(Call.outcome == outcome)
+        if market:
+            query = query.where(Call.market == market)
+            count_query = count_query.where(Call.market == market)
+
+        total = (await self.db.execute(count_query)).scalar()
+        query = query.order_by(Call.created_at.desc())
+        query = query.offset((page - 1) * page_size).limit(page_size)
+        result = await self.db.execute(query)
+        calls = result.scalars().all()
+
+        return {
+            "calls": calls,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    async def get_analytics(self, market: str | None = None) -> dict:
+        """Call analytics summary."""
+        base_query = select(Call)
+        if market:
+            base_query = base_query.where(Call.market == market)
+
+        # Total calls
+        total = (await self.db.execute(
+            select(func.count(Call.id)).select_from(Call)
+        )).scalar()
+
+        # Outcome breakdown
+        outcome_query = select(Call.outcome, func.count(Call.id)).group_by(Call.outcome)
+        outcome_result = await self.db.execute(outcome_query)
+        outcomes = {row[0] or "unknown": row[1] for row in outcome_result.all()}
+
+        return {
+            "total_calls": total,
+            "outcomes": outcomes,
+        }
+
+========================================================================================================================
+FILE: app\services\compliance.py
+========================================================================================================================
+"""
+Compliance Monitor Service
+
+Rule-based compliance checking for loan pre-due reminder calls.
+
+Checks:
+- Required disclosures (identity, recording notice, purpose)
+- Prohibited language (threats, misleading statements)
+- Fair practice code adherence
+- Call time restrictions
+- Maximum contact frequency
+"""
+
+import logging
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ComplianceViolation:
+    """A detected compliance violation."""
+    rule_id: str
+    severity: str  # critical | warning | info
+    description: str
+    recommendation: str
+
+
+# Required disclosures that must be present in the call
+REQUIRED_DISCLOSURES = [
+    {
+        "id": "disclosure_identity",
+        "description": "Agent must identify themselves and the company",
+        "keywords": ["my name is", "calling from", "on behalf of"],
+        "severity": "critical",
+    },
+    {
+        "id": "disclosure_purpose",
+        "description": "Agent must state the purpose of the call",
+        "keywords": ["payment reminder", "upcoming payment", "emi due", "installment due"],
+        "severity": "critical",
+    },
+    {
+        "id": "disclosure_recording",
+        "description": "Agent should mention call may be recorded",
+        "keywords": ["call may be recorded", "recording", "quality purposes"],
+        "severity": "warning",
+    },
+]
+
+# Prohibited patterns
+PROHIBITED_PATTERNS = [
+    {
+        "id": "prohibited_threat",
+        "description": "Threatening language or intimidation",
+        "keywords": ["legal action", "sue you", "arrest", "police", "jail", "garnish"],
+        "severity": "critical",
+    },
+    {
+        "id": "prohibited_misleading",
+        "description": "Misleading or false statements",
+        "keywords": ["guaranteed", "no risk", "definitely will", "I promise"],
+        "severity": "warning",
+    },
+    {
+        "id": "prohibited_disclosure_pii",
+        "description": "Disclosing loan details to third parties",
+        "keywords": [],  # Requires context analysis
+        "severity": "critical",
+    },
+]
+
+
+class ComplianceMonitor:
+    """
+    Compliance checking service for call transcripts.
+    
+    Usage:
+        monitor = ComplianceMonitor()
+        violations = monitor.check_transcript(transcript)
+        missing = monitor.check_required_disclosures(transcript)
+    """
+
+    def check_transcript(self, transcript: str) -> list[ComplianceViolation]:
+        """Check a transcript for compliance violations."""
+        violations = []
+        transcript_lower = transcript.lower()
+
+        # Check prohibited patterns
+        for pattern in PROHIBITED_PATTERNS:
+            for keyword in pattern["keywords"]:
+                if keyword.lower() in transcript_lower:
+                    violations.append(ComplianceViolation(
+                        rule_id=pattern["id"],
+                        severity=pattern["severity"],
+                        description=pattern["description"],
+                        recommendation=f"Review usage of '{keyword}' in the conversation.",
+                    ))
+
+        return violations
+
+    def check_required_disclosures(self, transcript: str) -> list[ComplianceViolation]:
+        """Check if all required disclosures have been made."""
+        missing = []
+        transcript_lower = transcript.lower()
+
+        for disclosure in REQUIRED_DISCLOSURES:
+            found = any(
+                keyword.lower() in transcript_lower
+                for keyword in disclosure["keywords"]
+            )
+            if not found:
+                missing.append(ComplianceViolation(
+                    rule_id=disclosure["id"],
+                    severity=disclosure["severity"],
+                    description=f"Missing required disclosure: {disclosure['description']}",
+                    recommendation=f"Ensure the agent includes: {', '.join(disclosure['keywords'][:2])}",
+                ))
+
+        return missing
+
+    def get_compliance_score(self, transcript: str) -> dict:
+        """
+        Calculate an overall compliance score for a call.
+        
+        Returns:
+            {score: float, violations: list, missing_disclosures: list}
+        """
+        violations = self.check_transcript(transcript)
+        missing = self.check_required_disclosures(transcript)
+
+        # Score: start at 1.0, deduct for issues
+        score = 1.0
+        for v in violations:
+            if v.severity == "critical":
+                score -= 0.3
+            elif v.severity == "warning":
+                score -= 0.1
+        for m in missing:
+            if m.severity == "critical":
+                score -= 0.2
+            elif m.severity == "warning":
+                score -= 0.1
+
+        return {
+            "score": max(0.0, round(score, 2)),
+            "violations": [{"rule_id": v.rule_id, "severity": v.severity, "description": v.description} for v in violations],
+            "missing_disclosures": [{"rule_id": m.rule_id, "severity": m.severity, "description": m.description} for m in missing],
+        }
+
+========================================================================================================================
+FILE: app\services\knowledge_service.py
+========================================================================================================================
+"""
+Knowledge Service — KB Ingestion & CRUD (Q2)
+
+Handles:
+- Bulk record ingestion (parse → clean → PII detect → chunk → embed → store)
+- CRUD operations on KB records
+- Re-embedding on content updates
+- Statistics and reporting
+
+Ingestion pipeline:
+1. Validate incoming records
+2. Run PII detection (Presidio) → flag and create clean version
+3. Chunk long content using configured strategy
+4. Generate embeddings (OpenAI)
+5. Store records in PostgreSQL
+6. Upsert vectors in Pinecone
+"""
+
+import logging
+import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+
+from app.models.knowledge import KBRecord
+from app.schemas.knowledge import KBRecordCreate, KBRecordUpdate
+from app.services.rag_service import RAGService
+from app.utils.pii import detect_pii, redact_pii
+from app.utils.chunking import chunk_text
+from app.core.pinecone_client import upsert_vectors, delete_vectors
+
+logger = logging.getLogger(__name__)
+
+
+class KnowledgeService:
+    """
+    Knowledge base management service.
+    
+    Usage:
+        service = KnowledgeService(db)
+        await service.ingest_records(records=[...], embed=True, detect_pii=True)
+    """
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.rag = RAGService(db)
+
+    async def ingest_records(
+        self,
+        records: list[KBRecordCreate],
+        embed: bool = True,
+        detect_pii_flag: bool = True,
+    ) -> dict:
+        """
+        Bulk ingest KB records through the full pipeline.
+        
+        Returns summary: {ingested: int, chunks_created: int, pii_flagged: int, errors: list}
+        """
+        ingested = 0
+        chunks_created = 0
+        pii_flagged = 0
+        errors = []
+        vectors_to_upsert = []
+
+        for record in records:
+            try:
+                # Step 1: PII Detection
+                contains_pii = False
+                content_clean = record.content
+                if detect_pii_flag:
+                    pii_results = detect_pii(record.content)
+                    if pii_results:
+                        contains_pii = True
+                        content_clean = redact_pii(record.content, pii_results)
+                        pii_flagged += 1
+
+                # Step 2: Chunk content
+                chunks = chunk_text(
+                    text=record.content,
+                    category=record.category,
+                )
+
+                for i, chunk in enumerate(chunks):
+                    chunk_record_id = f"{record.record_id}_chunk_{i}" if len(chunks) > 1 else record.record_id
+                    embedding_id = f"vec_{chunk_record_id}"
+
+                    # Step 3: Create DB record
+                    db_record = KBRecord(
+                        id=uuid.uuid4(),
+                        record_id=chunk_record_id,
+                        title=record.title,
+                        content=chunk["text"],
+                        content_clean=redact_pii(chunk["text"], detect_pii(chunk["text"])) if contains_pii else chunk["text"],
+                        category=record.category,
+                        subcategory=record.subcategory,
+                        source=record.source,
+                        source_url=record.source_url,
+                        version=record.version,
+                        contains_pii=contains_pii,
+                        metadata_=record.metadata,
+                        chunk_id=f"chunk_{i}",
+                        parent_doc_id=record.record_id,
+                        embedding_id=embedding_id,
+                        token_count=chunk["token_count"],
+                        language=record.language,
+                    )
+                    self.db.add(db_record)
+                    chunks_created += 1
+
+                    # Step 4: Prepare vector for Pinecone
+                    if embed:
+                        embedding = await self.rag.embed_text(chunk["text"])
+                        vectors_to_upsert.append({
+                            "id": embedding_id,
+                            "values": embedding,
+                            "metadata": {
+                                "record_id": chunk_record_id,
+                                "title": record.title,
+                                "content": chunk["text"][:500],  # Preview
+                                "category": record.category,
+                                "subcategory": record.subcategory or "",
+                                "source": record.source,
+                                "source_url": record.source_url or "",
+                                "language": record.language,
+                                "product_type": record.metadata.get("product_type", []) if record.metadata else [],
+                                "applicable_market": record.metadata.get("applicable_market", "all") if record.metadata else "all",
+                            },
+                        })
+
+                ingested += 1
+
+            except Exception as e:
+                errors.append({"record_id": record.record_id, "error": str(e)})
+                logger.error(f"Failed to ingest {record.record_id}: {e}")
+
+        # Step 5: Commit to DB
+        await self.db.flush()
+
+        # Step 6: Upsert vectors to Pinecone
+        if vectors_to_upsert:
+            upsert_vectors(vectors_to_upsert)
+
+        return {
+            "ingested": ingested,
+            "chunks_created": chunks_created,
+            "pii_flagged": pii_flagged,
+            "vectors_upserted": len(vectors_to_upsert),
+            "errors": errors,
+        }
+
+    async def list_records(
+        self,
+        category: str | None = None,
+        language: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        """List KB records with optional filters and pagination."""
+        query = select(KBRecord)
+        count_query = select(func.count(KBRecord.id))
+
+        if category:
+            query = query.where(KBRecord.category == category)
+            count_query = count_query.where(KBRecord.category == category)
+        if language:
+            query = query.where(KBRecord.language == language)
+            count_query = count_query.where(KBRecord.language == language)
+
+        total = (await self.db.execute(count_query)).scalar()
+        query = query.offset((page - 1) * page_size).limit(page_size)
+        result = await self.db.execute(query)
+        records = result.scalars().all()
+
+        return {
+            "records": records,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    async def get_record(self, record_id: str) -> KBRecord | None:
+        """Get a single KB record by record_id."""
+        result = await self.db.execute(
+            select(KBRecord).where(KBRecord.record_id == record_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def update_record(self, record_id: str, update: KBRecordUpdate) -> KBRecord | None:
+        """Update a KB record. Re-embeds if content changes."""
+        record = await self.get_record(record_id)
+        if not record:
+            return None
+
+        update_data = update.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(record, key, value)
+
+        # Re-embed if content changed
+        if "content" in update_data:
+            embedding = await self.rag.embed_text(update_data["content"])
+            upsert_vectors([{
+                "id": record.embedding_id,
+                "values": embedding,
+                "metadata": {
+                    "record_id": record.record_id,
+                    "title": record.title,
+                    "content": record.content[:500],
+                    "category": record.category,
+                },
+            }])
+
+        await self.db.flush()
+        return record
+
+    async def delete_record(self, record_id: str):
+        """Delete a KB record and its Pinecone vector."""
+        record = await self.get_record(record_id)
+        if record:
+            if record.embedding_id:
+                delete_vectors([record.embedding_id])
+            await self.db.delete(record)
+            await self.db.flush()
+
+    async def get_stats(self) -> dict:
+        """Get KB statistics."""
+        total = (await self.db.execute(select(func.count(KBRecord.id)))).scalar()
+        
+        # Category breakdown
+        cat_query = select(KBRecord.category, func.count(KBRecord.id)).group_by(KBRecord.category)
+        cat_result = await self.db.execute(cat_query)
+        categories = {row[0]: row[1] for row in cat_result.all()}
+
+        return {
+            "total_records": total,
+            "categories": categories,
+        }
+
+========================================================================================================================
+FILE: app\services\nudge_engine.py
+========================================================================================================================
+"""
+Nudge Engine — Real-Time Call Analysis & Nudge Generation (Q4 Core)
+
+Orchestrates the full real-time nudge pipeline:
+1. Audio input (live stream or simulated replay)
+2. Streaming ASR via Deepgram → transcript segments
+3. Signal extraction via LLM (GPT-4o)
+4. Nudge generation with actionable recommendations
+5. Nudge control (confidence threshold, dedup, cooldown, priority, expiry)
+6. Delivery via Redis pub/sub → SSE to dashboard
+7. Latency measurement at each component
+
+Pipeline: audio → ASR → buffer → signals → nudges → controls → deliver
+"""
+
+import time
+import uuid
+import json
+import asyncio
+import logging
+from datetime import datetime
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+
+from app.models.nudge import Nudge
+from app.core.redis import publish_nudge
+from app.services.signal_extractor import SignalExtractor
+from app.services.streaming_asr import StreamingASR
+from app.utils.latency import LatencyTracker
+
+logger = logging.getLogger(__name__)
+
+# --- Nudge Control Constants ---
+CONFIDENCE_THRESHOLD = 0.6
+COOLDOWN_SECONDS = 15
+MAX_NUDGES_PER_CALL = 8
+DEDUP_WINDOW_SECONDS = 60
+NUDGE_EXPIRY_SECONDS = 45
+
+
+class NudgeEngine:
+    """
+    Real-time nudge generation engine.
+    
+    Usage:
+        engine = NudgeEngine(db)
+        session_id = await engine.start_session(call_id="...", audio_source="file.wav")
+    """
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.signal_extractor = SignalExtractor()
+        self.streaming_asr = StreamingASR()
+        self._active_sessions: dict[str, asyncio.Task] = {}
+        self._nudge_history: dict[str, list] = {}  # call_id → list of recent nudges
+        self._last_nudge_time: dict[str, float] = {}  # call_id → timestamp
+
+    async def start_session(
+        self,
+        call_id: str,
+        audio_source: str,
+        chunk_ms: int = 250,
+    ) -> str:
+        """
+        Start a nudge processing session.
+        
+        Args:
+            call_id: The call to monitor
+            audio_source: "live" or path to audio file for simulation
+            chunk_ms: Audio chunk size in milliseconds
+        
+        Returns:
+            Session ID
+        """
+        session_id = str(uuid.uuid4())
+        self._nudge_history[call_id] = []
+        self._last_nudge_time[call_id] = 0
+
+        if audio_source == "live":
+            task = asyncio.create_task(self._process_live(call_id))
+        else:
+            task = asyncio.create_task(
+                self._process_simulated(call_id, audio_source, chunk_ms)
+            )
+
+        self._active_sessions[call_id] = task
+        return session_id
+
+    async def stop_session(self, call_id: str):
+        """Stop an active nudge session."""
+        task = self._active_sessions.pop(call_id, None)
+        if task:
+            task.cancel()
+
+    async def _process_simulated(self, call_id: str, audio_path: str, chunk_ms: int):
+        """
+        Process a recorded audio file at real-time speed.
+        
+        Reads audio, chunks it, sends to Deepgram streaming,
+        processes transcript for signals, generates nudges.
+        """
+        latency = LatencyTracker()
+        transcript_buffer = ""
+        last_processed_pos = 0
+
+        try:
+            async for segment in self.streaming_asr.transcribe_file(audio_path, chunk_ms):
+                # Measure ASR latency
+                asr_latency = segment.get("latency_ms", 0)
+
+                # Buffer transcript
+                transcript_buffer += " " + segment.get("text", "")
+
+                # Process every ~500 words or significant new content
+                new_text = transcript_buffer[last_processed_pos:]
+                if len(new_text.split()) >= 30:  # Process every ~30 words
+                    # Extract signals
+                    signal_start = time.time()
+                    signals = await self.signal_extractor.extract(
+                        transcript=transcript_buffer,
+                        new_segment=new_text,
+                    )
+                    signal_latency = (time.time() - signal_start) * 1000
+
+                    for signal in signals:
+                        # Generate nudge
+                        llm_start = time.time()
+                        nudge = await self.signal_extractor.generate_nudge(signal)
+                        llm_latency = (time.time() - llm_start) * 1000
+
+                        # Apply controls
+                        delivery_start = time.time()
+                        should_deliver, suppression_reason = self._apply_controls(
+                            call_id, nudge
+                        )
+                        delivery_latency = (time.time() - delivery_start) * 1000
+
+                        # Build latency breakdown
+                        latency_ms = {
+                            "asr": round(asr_latency, 2),
+                            "signal": round(signal_latency, 2),
+                            "llm": round(llm_latency, 2),
+                            "delivery": round(delivery_latency, 2),
+                            "total": round(asr_latency + signal_latency + llm_latency + delivery_latency, 2),
+                        }
+
+                        # Save nudge to DB
+                        db_nudge = Nudge(
+                            id=uuid.uuid4(),
+                            call_id=uuid.UUID(call_id) if self._is_uuid(call_id) else uuid.uuid4(),
+                            signal_type=signal["type"],
+                            signal_text=signal["text"],
+                            nudge_text=nudge["text"],
+                            confidence=signal["confidence"],
+                            priority=signal.get("priority", "medium"),
+                            displayed=should_deliver,
+                            suppressed=not should_deliver,
+                            suppression_reason=suppression_reason,
+                            latency_ms=latency_ms,
+                            transcript_position=len(transcript_buffer.split()),
+                        )
+                        self.db.add(db_nudge)
+
+                        # Deliver if not suppressed
+                        if should_deliver:
+                            await publish_nudge(call_id, {
+                                "id": str(db_nudge.id),
+                                "signal_type": signal["type"],
+                                "signal_text": signal["text"],
+                                "nudge_text": nudge["text"],
+                                "confidence": signal["confidence"],
+                                "priority": signal.get("priority", "medium"),
+                                "latency_ms": latency_ms,
+                                "timestamp": datetime.utcnow().isoformat(),
+                            })
+                            self._last_nudge_time[call_id] = time.time()
+
+                    last_processed_pos = len(transcript_buffer)
+
+            await self.db.flush()
+
+        except asyncio.CancelledError:
+            logger.info(f"Nudge session cancelled for call {call_id}")
+        except Exception as e:
+            logger.error(f"Nudge session error for call {call_id}: {e}")
+
+    async def _process_live(self, call_id: str):
+        """Process live call audio (hooks into Vapi real-time events)."""
+        # TODO: Implement live call processing
+        # This would subscribe to Vapi's real-time transcript events
+        # and process them through the same signal extraction pipeline
+        pass
+
+    def _apply_controls(self, call_id: str, nudge: dict) -> tuple[bool, str | None]:
+        """
+        Apply nudge control rules.
+        
+        Returns: (should_deliver, suppression_reason)
+        """
+        # 1. Confidence threshold
+        if nudge.get("confidence", 0) < CONFIDENCE_THRESHOLD:
+            return False, "low_confidence"
+
+        # 2. Cooldown
+        last_time = self._last_nudge_time.get(call_id, 0)
+        if time.time() - last_time < COOLDOWN_SECONDS:
+            return False, "cooldown"
+
+        # 3. Max per call
+        history = self._nudge_history.get(call_id, [])
+        delivered_count = sum(1 for n in history if not n.get("suppressed"))
+        if delivered_count >= MAX_NUDGES_PER_CALL:
+            return False, "max_per_call"
+
+        # 4. Duplicate suppression
+        nudge_key = f"{nudge.get('signal_type')}:{nudge.get('key_entity', '')}"
+        recent_keys = [n.get("key") for n in history[-10:]]
+        if nudge_key in recent_keys:
+            return False, "duplicate"
+
+        # Record in history
+        history.append({
+            "key": nudge_key,
+            "time": time.time(),
+            "suppressed": False,
+        })
+        self._nudge_history[call_id] = history
+
+        return True, None
+
+    def _is_uuid(self, value: str) -> bool:
+        """Check if a string is a valid UUID."""
+        try:
+            uuid.UUID(value)
+            return True
+        except ValueError:
+            return False
+
+    async def analyze_call(self, call_id: str) -> dict | None:
+        """Generate nudge quality analysis for a call."""
+        result = await self.db.execute(
+            select(Nudge).where(Nudge.call_id == call_id)
+        )
+        nudges = result.scalars().all()
+        if not nudges:
+            return None
+
+        delivered = [n for n in nudges if not n.suppressed]
+        suppressed = [n for n in nudges if n.suppressed]
+
+        # Latency calculations
+        latencies = [n.latency_ms.get("total", 0) for n in nudges if n.latency_ms]
+        latencies.sort()
+
+        p50 = latencies[len(latencies) // 2] if latencies else 0
+        p95_idx = int(len(latencies) * 0.95) if latencies else 0
+        p95 = latencies[min(p95_idx, len(latencies) - 1)] if latencies else 0
+
+        return {
+            "call_id": call_id,
+            "total_nudges": len(nudges),
+            "delivered_nudges": len(delivered),
+            "suppressed_nudges": len(suppressed),
+            "suppression_breakdown": {},  # TODO: aggregate by reason
+            "avg_confidence": sum(n.confidence for n in nudges) / len(nudges) if nudges else 0,
+            "avg_latency_ms": {},
+            "p50_latency_ms": p50,
+            "p95_latency_ms": p95,
+            "signal_type_breakdown": {},
+            "false_positive_estimate": 0.0,
+        }
+
+    async def generate_latency_report(self) -> dict:
+        """Generate aggregate latency report across all calls."""
+        # TODO: Aggregate latency data across all nudges
+        return {
+            "total_calls_analyzed": 0,
+            "total_nudges_generated": 0,
+            "total_nudges_delivered": 0,
+            "total_nudges_suppressed": 0,
+            "component_latency": {},
+            "end_to_end_latency": {"p50": 0, "p95": 0},
+            "signal_type_accuracy": {},
+        }
+
+========================================================================================================================
+FILE: app\services\rag_service.py
+========================================================================================================================
+"""
+RAG Service — Retrieval-Augmented Generation (Q2 Core)
+
+Full RAG pipeline:
+1. Embed query using OpenAI text-embedding-3-small
+2. Search Pinecone with metadata filters (category, product_type, language, market)
+3. Rerank results using LLM-as-judge (or cross-encoder)
+4. Attach citations (record_id, source, version)
+5. Generate grounded response with source references
+
+Also provides:
+- Embedding generation for KB ingestion
+- Retrieval test runner (5+ queries for Q2 evaluation)
+- Langfuse tracing for all operations
+"""
+
+import time
+import logging
+from openai import AsyncOpenAI
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.core.pinecone_client import query_vectors
+from app.core.langfuse_client import create_trace
+
+logger = logging.getLogger(__name__)
+
+
+class RAGService:
+    """
+    Production RAG service with embed → retrieve → rerank → cite pipeline.
+    
+    Usage:
+        rag = RAGService(db)
+        results = await rag.search(query="What is the late payment penalty?")
+    """
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.openai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.embedding_model = settings.OPENAI_EMBEDDING_MODEL
+        self.llm_model = settings.OPENAI_LLM_MODEL
+
+    async def embed_text(self, text: str) -> list[float]:
+        """Generate embedding for a single text string."""
+        response = await self.openai.embeddings.create(
+            model=self.embedding_model,
+            input=text,
+        )
+        return response.data[0].embedding
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for a batch of texts."""
+        response = await self.openai.embeddings.create(
+            model=self.embedding_model,
+            input=texts,
+        )
+        return [item.embedding for item in response.data]
+
+    async def search(
+        self,
+        query: str,
+        category: str | None = None,
+        product_type: str | None = None,
+        language: str | None = None,
+        market: str | None = None,
+        top_k: int = 5,
+    ) -> dict:
+        """
+        Full RAG search pipeline.
+        
+        Steps:
+        1. Embed query
+        2. Build metadata filter
+        3. Query Pinecone (top_k * 2 for reranking headroom)
+        4. Rerank using LLM
+        5. Return top_k results with citations
+        """
+        start_time = time.time()
+        trace = create_trace(name="rag_search", metadata={"query": query})
+
+        # Step 1: Embed query
+        query_embedding = await self.embed_text(query)
+
+        # Step 2: Build metadata filter
+        pinecone_filter = self._build_filter(category, product_type, language, market)
+
+        # Step 3: Query Pinecone
+        raw_results = query_vectors(
+            query_embedding=query_embedding,
+            top_k=top_k * 2,  # Fetch extra for reranking
+            filter_dict=pinecone_filter,
+        )
+
+        # Step 4: Rerank (optional, can use LLM-as-judge or cross-encoder)
+        reranked = await self._rerank(query, raw_results, top_k)
+
+        # Step 5: Format with citations
+        results = self._format_results(reranked)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        return {
+            "query": query,
+            "results": results,
+            "total": len(results),
+            "retrieval_time_ms": round(elapsed_ms, 2),
+        }
+
+    def _build_filter(self, category, product_type, language, market) -> dict | None:
+        """Build Pinecone metadata filter from optional parameters."""
+        filters = {}
+        if category:
+            filters["category"] = category
+        if product_type:
+            filters["product_type"] = {"$in": [product_type]}
+        if language:
+            filters["language"] = language
+        if market:
+            filters["applicable_market"] = market
+        return filters if filters else None
+
+    async def _rerank(self, query: str, results: list[dict], top_k: int) -> list[dict]:
+        """
+        Rerank results using LLM-as-judge.
+        
+        For production: use a cross-encoder model (ms-marco-MiniLM).
+        For this implementation: use GPT-4o-mini as judge for quality.
+        """
+        if not results:
+            return []
+
+        # Simple approach: use cosine similarity score as ranking
+        # TODO: Implement LLM-as-judge reranking for higher quality
+        sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
+        return sorted_results[:top_k]
+
+    def _format_results(self, results: list[dict]) -> list[dict]:
+        """Format results with citation information."""
+        formatted = []
+        for result in results:
+            metadata = result.get("metadata", {})
+            formatted.append({
+                "record_id": metadata.get("record_id", ""),
+                "title": metadata.get("title", ""),
+                "content": metadata.get("content", ""),
+                "category": metadata.get("category", ""),
+                "source": metadata.get("source", ""),
+                "source_url": metadata.get("source_url"),
+                "relevance_score": round(result["score"], 4),
+                "metadata": metadata,
+            })
+        return formatted
+
+    async def search_for_voice(self, query: str, category: str | None = None) -> dict:
+        """
+        Simplified search for voice agent tool calls.
+        
+        Returns a concise answer string suitable for the LLM to speak,
+        plus source citations for grounding.
+        """
+        results = await self.search(query=query, category=category, top_k=3)
+
+        if not results["results"]:
+            return {
+                "found": False,
+                "answer": "I don't have specific information about that in my knowledge base. Let me connect you with a team member who can help.",
+                "sources": [],
+                "confidence": 0.0,
+            }
+
+        # Build context from top results
+        context_parts = []
+        sources = []
+        for r in results["results"]:
+            context_parts.append(r["content"])
+            sources.append({
+                "record_id": r["record_id"],
+                "title": r["title"],
+                "source": r["source"],
+            })
+
+        context = "\n\n".join(context_parts)
+        top_score = results["results"][0]["relevance_score"]
+
+        return {
+            "found": True,
+            "answer": context,
+            "sources": sources,
+            "confidence": top_score,
+        }
+
+    async def run_retrieval_test(self) -> list[dict]:
+        """
+        Run the Q2 retrieval test: 7 predefined queries.
+        
+        Loads test cases from evaluation/test_cases/rag_retrieval.json
+        and evaluates each one against expected keywords.
+        """
+        import json
+        import os
+
+        test_cases_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            "evaluation", "test_cases", "rag_retrieval.json",
+        )
+
+        if not os.path.exists(test_cases_path):
+            return [{"error": "Test cases file not found", "path": test_cases_path}]
+
+        with open(test_cases_path, "r") as f:
+            test_cases = json.load(f)
+
+        results = []
+        for tc in test_cases:
+            try:
+                search_result = await self.search(
+                    query=tc["query"],
+                    category=tc.get("expected_category"),
+                    top_k=3,
+                )
+
+                # Evaluate keyword matches
+                result_text = " ".join(
+                    r.get("content", "") + " " + r.get("title", "")
+                    for r in search_result.get("results", [])
+                ).lower()
+
+                expected_kw = tc.get("expected_keywords", [])
+                matched = [kw for kw in expected_kw if kw.lower() in result_text]
+                ratio = len(matched) / len(expected_kw) if expected_kw else 0
+
+                verdict = "correct" if ratio >= 0.6 else ("partially_correct" if ratio >= 0.3 else "incorrect")
+
+                top = search_result["results"][0] if search_result.get("results") else None
+                results.append({
+                    "test_id": tc["test_id"],
+                    "query": tc["query"],
+                    "retrieved_record": {
+                        "record_id": top["record_id"] if top else None,
+                        "title": top["title"] if top else None,
+                        "content": top["content"][:200] if top else None,
+                        "category": top["category"] if top else None,
+                        "source": top["source"] if top else None,
+                        "source_url": top.get("source_url") if top else None,
+                        "relevance_score": top["relevance_score"] if top else 0,
+                        "metadata": top.get("metadata") if top else None,
+                    } if top else None,
+                    "source_reference": f"{top['source']}:{top['record_id']}" if top else "none",
+                    "relevance_explanation": f"Matched {len(matched)}/{len(expected_kw)} expected keywords: {matched}",
+                    "verdict": verdict,
+                    "retrieval_time_ms": search_result.get("retrieval_time_ms", 0),
+                })
+
+            except Exception as e:
+                results.append({
+                    "test_id": tc["test_id"],
+                    "query": tc["query"],
+                    "verdict": "error",
+                    "error": str(e),
+                })
+
+        return results
+
+========================================================================================================================
+FILE: app\services\rule_engine.py
+========================================================================================================================
+"""
+Business Rule Engine (Q1)
+
+Declarative rule engine that evaluates business rules against conversation state.
+
+Rule types:
+- escalation: When to transfer to a human agent
+- compliance: Required disclosures and statements
+- qualification: Eligibility checks for programs
+- payment: Grace periods, late fees, penalty rules
+
+Rules are stored in PostgreSQL and loaded at startup.
+Each rule has a declarative condition (JSON) and action (JSON).
+
+Condition operators: eq, neq, gt, gte, lt, lte, in, contains, matches
+"""
+
+import logging
+import operator
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.models.business_rule import BusinessRule
+
+logger = logging.getLogger(__name__)
+
+# Operator mapping for declarative conditions
+OPERATORS = {
+    "eq": operator.eq,
+    "neq": operator.ne,
+    "gt": operator.gt,
+    "gte": operator.ge,
+    "lt": operator.lt,
+    "lte": operator.le,
+    "in": lambda a, b: a in b,
+    "contains": lambda a, b: b in a if isinstance(a, str) else b in a,
+}
+
+
+class RuleEngine:
+    """
+    Declarative business rule engine.
+    
+    Usage:
+        engine = RuleEngine(db)
+        actions = await engine.evaluate(conversation_state)
+    """
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self._rules_cache: list[BusinessRule] | None = None
+
+    async def load_rules(self, category: str | None = None, market: str = "all") -> list[BusinessRule]:
+        """Load active rules from database, optionally filtered by category and market."""
+        query = select(BusinessRule).where(BusinessRule.active == True)
+        if category:
+            query = query.where(BusinessRule.category == category)
+
+        query = query.where(
+            (BusinessRule.market == market) | (BusinessRule.market == "all")
+        )
+        query = query.order_by(BusinessRule.priority.desc())
+
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+    async def evaluate(self, state: dict, category: str | None = None, market: str = "all") -> list[dict]:
+        """
+        Evaluate all matching rules against the conversation state.
+        
+        Args:
+            state: Current conversation state dict
+            category: Optional category filter
+            market: Market filter (default: all)
+        
+        Returns:
+            List of triggered actions: [{"rule_id": "...", "action": {...}}]
+        """
+        rules = await self.load_rules(category=category, market=market)
+        triggered_actions = []
+
+        for rule in rules:
+            if self._evaluate_condition(rule.condition, state):
+                logger.info(f"Rule triggered: {rule.rule_id} - {rule.name}")
+                triggered_actions.append({
+                    "rule_id": rule.rule_id,
+                    "name": rule.name,
+                    "action": rule.action,
+                    "priority": rule.priority,
+                })
+
+        return triggered_actions
+
+    def _evaluate_condition(self, condition: dict, state: dict) -> bool:
+        """
+        Evaluate a single declarative condition against state.
+        
+        Condition format:
+            {"field": "objection_count", "operator": "gte", "value": 3}
+        
+        Compound conditions:
+            {"and": [condition1, condition2]}
+            {"or": [condition1, condition2]}
+        """
+        # Compound: AND
+        if "and" in condition:
+            return all(self._evaluate_condition(c, state) for c in condition["and"])
+
+        # Compound: OR
+        if "or" in condition:
+            return any(self._evaluate_condition(c, state) for c in condition["or"])
+
+        # Simple condition
+        field = condition.get("field", "")
+        op_name = condition.get("operator", "eq")
+        expected_value = condition.get("value")
+
+        actual_value = self._get_nested_value(state, field)
+        if actual_value is None:
+            return False
+
+        op_func = OPERATORS.get(op_name)
+        if not op_func:
+            logger.warning(f"Unknown operator: {op_name}")
+            return False
+
+        try:
+            return op_func(actual_value, expected_value)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Rule evaluation error: {e}")
+            return False
+
+    def _get_nested_value(self, state: dict, field: str):
+        """Get a potentially nested value from state using dot notation."""
+        keys = field.split(".")
+        value = state
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+            else:
+                return None
+        return value
+
+    async def check_compliance(self, state: dict, market: str = "all") -> list[dict]:
+        """Check compliance rules and return any violations or required disclosures."""
+        return await self.evaluate(state, category="compliance", market=market)
+
+    async def check_escalation(self, state: dict, market: str = "all") -> list[dict]:
+        """Check if escalation is required based on current state."""
+        return await self.evaluate(state, category="escalation", market=market)
+
+========================================================================================================================
+FILE: app\services\signal_extractor.py
+========================================================================================================================
+"""
+Signal Extractor — LLM-Based Signal Detection (Q4)
+
+Analyzes conversation transcript segments to detect:
+- Compliance gaps (missed disclosures, risky statements)
+- Sentiment shifts (rising frustration, confusion)
+- Buying signals (interest in products, upgrade intent)
+- Missed opportunities (cross-sell, upsell)
+- Payment difficulty indicators
+- Callback/escalation needs
+
+Uses GPT-4o for high-quality signal extraction.
+"""
+
+import logging
+import json
+from openai import AsyncOpenAI
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+SIGNAL_EXTRACTION_PROMPT = """You are a real-time call analysis system for a loan pre-due reminder call center.
+
+Analyze the following conversation segment and detect any actionable signals.
+
+SIGNAL TYPES:
+1. compliance_gap — Agent missed a required disclosure, made a risky/misleading statement, or violated fair practice guidelines
+2. sentiment — Customer shows frustration, anger, confusion, or significant emotional shift
+3. cross_sell — Customer mentions needs that could be addressed by other products or services
+4. missed_opportunity — Agent missed a chance to address a concern, offer a solution, or build rapport
+5. payment_difficulty — Customer indicates financial hardship, inability to pay, or requests for concessions
+6. risk — Agent made a promise they can't keep, or provided potentially incorrect information
+
+For each signal detected, provide:
+- type: one of the signal types above
+- text: brief description of what was detected
+- confidence: 0.0 to 1.0 (how certain you are this is a real signal)
+- priority: critical | high | medium | low
+- key_entity: the key entity or concept involved (for deduplication)
+
+Return a JSON array of signals. Return empty array [] if no signals detected.
+Be conservative — only flag genuine, actionable signals. Avoid false positives.
+
+FULL CONVERSATION SO FAR:
+{transcript}
+
+NEW SEGMENT TO ANALYZE:
+{new_segment}
+
+Respond with ONLY a valid JSON array:"""
+
+NUDGE_GENERATION_PROMPT = """Generate a short, actionable nudge for a call center agent based on this signal:
+
+Signal Type: {signal_type}
+Signal: {signal_text}
+
+Requirements:
+- Maximum 2 sentences
+- Must be immediately actionable
+- Must be specific to the situation
+- Do not be vague or generic
+
+Respond with ONLY the nudge text, no JSON or formatting:"""
+
+
+class SignalExtractor:
+    """
+    LLM-based signal extraction from conversation transcripts.
+    
+    Usage:
+        extractor = SignalExtractor()
+        signals = await extractor.extract(transcript="...", new_segment="...")
+    """
+
+    def __init__(self):
+        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.model = settings.OPENAI_LLM_MODEL  # GPT-4o for quality
+
+    async def extract(self, transcript: str, new_segment: str) -> list[dict]:
+        """
+        Extract signals from a conversation transcript segment.
+        
+        Args:
+            transcript: Full conversation so far
+            new_segment: New text to analyze
+        
+        Returns:
+            List of signal dicts: [{type, text, confidence, priority, key_entity}]
+        """
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a precise real-time call analysis system. Only detect genuine, actionable signals. Minimize false positives."
+                    },
+                    {
+                        "role": "user",
+                        "content": SIGNAL_EXTRACTION_PROMPT.format(
+                            transcript=transcript[-2000:],  # Last 2000 chars for context
+                            new_segment=new_segment,
+                        ),
+                    },
+                ],
+                temperature=0.1,  # Low temperature for consistent detection
+                max_tokens=500,
+            )
+
+            content = response.choices[0].message.content.strip()
+
+            # Parse JSON response
+            signals = json.loads(content)
+            if isinstance(signals, list):
+                return signals
+            return []
+
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse signal extraction response as JSON")
+            return []
+        except Exception as e:
+            logger.error(f"Signal extraction failed: {e}")
+            return []
+
+    async def generate_nudge(self, signal: dict) -> dict:
+        """
+        Generate an actionable nudge from a detected signal.
+        
+        Args:
+            signal: Signal dict from extract()
+        
+        Returns:
+            Nudge dict: {text, confidence, signal_type, key_entity}
+        """
+        try:
+            response = await self.client.chat.completions.create(
+                model=settings.OPENAI_LLM_MODEL_MINI,  # Use mini for speed
+                messages=[
+                    {
+                        "role": "user",
+                        "content": NUDGE_GENERATION_PROMPT.format(
+                            signal_type=signal.get("type", ""),
+                            signal_text=signal.get("text", ""),
+                        ),
+                    },
+                ],
+                temperature=0.3,
+                max_tokens=100,
+            )
+
+            nudge_text = response.choices[0].message.content.strip()
+            return {
+                "text": nudge_text,
+                "confidence": signal.get("confidence", 0.5),
+                "signal_type": signal.get("type", ""),
+                "key_entity": signal.get("key_entity", ""),
+            }
+
+        except Exception as e:
+            logger.error(f"Nudge generation failed: {e}")
+            return {
+                "text": f"Check: {signal.get('text', 'Signal detected')}",
+                "confidence": signal.get("confidence", 0.5),
+                "signal_type": signal.get("type", ""),
+                "key_entity": signal.get("key_entity", ""),
+            }
+
+========================================================================================================================
+FILE: app\services\streaming_asr.py
+========================================================================================================================
+"""
+Streaming ASR — Deepgram Nova-2 Integration (Q4)
+
+Provides streaming transcription for the real-time nudge pipeline:
+- Live audio stream transcription via WebSocket
+- File-based audio replay at real-time speed (for simulation/demo)
+- Speaker diarization (agent vs customer)
+- Per-chunk latency measurement
+
+Uses Deepgram Nova-2 for best-in-class streaming latency (~200ms).
+"""
+
+import time
+import asyncio
+import logging
+import wave
+import io
+
+import logging
+
+try:
+    from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions, PrerecordedOptions
+    DEEPGRAM_AVAILABLE = True
+except ImportError:
+    DEEPGRAM_AVAILABLE = False
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class StreamingASR:
+    """
+    Streaming ASR service using Deepgram.
+    
+    Usage:
+        asr = StreamingASR()
+        async for segment in asr.transcribe_file("call.wav", chunk_ms=250):
+            print(segment["text"])
+    """
+
+    def __init__(self):
+        self.client = None
+        if DEEPGRAM_AVAILABLE and settings.DEEPGRAM_API_KEY:
+            self.client = DeepgramClient(settings.DEEPGRAM_API_KEY)
+
+    async def transcribe_file(
+        self,
+        audio_path: str,
+        chunk_ms: int = 250,
+    ):
+        """
+        Transcribe an audio file at real-time speed (simulated streaming).
+        
+        Reads the audio file, chunks it, and sends to Deepgram
+        with real-time pacing to simulate live audio.
+        
+        Yields transcript segments with latency measurements.
+        """
+        # Read audio file
+        audio_data = self._read_audio_file(audio_path)
+        if not audio_data:
+            logger.error(f"Failed to read audio file: {audio_path}")
+            return
+
+        # Calculate chunk size from audio parameters
+        sample_rate = audio_data["sample_rate"]
+        channels = audio_data["channels"]
+        sample_width = audio_data["sample_width"]
+        bytes_per_second = sample_rate * channels * sample_width
+        chunk_bytes = int(bytes_per_second * chunk_ms / 1000)
+
+        raw_audio = audio_data["frames"]
+
+        # Set up Deepgram live transcription
+        # TODO: Implement Deepgram WebSocket streaming
+        # For now, use pre-recorded API with chunking simulation
+
+        try:
+            # Simulate real-time by processing chunks with delays
+            for i in range(0, len(raw_audio), chunk_bytes):
+                chunk = raw_audio[i : i + chunk_bytes]
+                chunk_start = time.time()
+
+                # Send chunk to Deepgram (pre-recorded as fallback)
+                # In production, use WebSocket streaming for true real-time
+                transcript_result = await self._transcribe_chunk(chunk, sample_rate)
+
+                chunk_latency = (time.time() - chunk_start) * 1000
+
+                if transcript_result:
+                    yield {
+                        "text": transcript_result.get("text", ""),
+                        "speaker": transcript_result.get("speaker", "unknown"),
+                        "start": i / bytes_per_second,
+                        "end": (i + len(chunk)) / bytes_per_second,
+                        "latency_ms": chunk_latency,
+                        "confidence": transcript_result.get("confidence", 0.0),
+                    }
+
+                # Real-time pacing
+                await asyncio.sleep(chunk_ms / 1000)
+
+        except Exception as e:
+            logger.error(f"Streaming transcription error: {e}")
+
+    async def _transcribe_chunk(self, audio_chunk: bytes, sample_rate: int) -> dict | None:
+        """Transcribe a single audio chunk using Deepgram."""
+        try:
+            options = PrerecordedOptions(
+                model="nova-2",
+                language="en",
+                smart_format=True,
+                diarize=True,
+            )
+
+            # Create a WAV buffer for the chunk
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(audio_chunk)
+
+            wav_buffer.seek(0)
+            source = {"buffer": wav_buffer.read(), "mimetype": "audio/wav"}
+
+            response = self.client.listen.prerecorded.v("1").transcribe_file(source, options)
+
+            if response and response.results:
+                channel = response.results.channels[0]
+                if channel.alternatives:
+                    alt = channel.alternatives[0]
+                    return {
+                        "text": alt.transcript,
+                        "confidence": alt.confidence,
+                        "speaker": "unknown",  # TODO: Parse diarization
+                    }
+            return None
+
+        except Exception as e:
+            logger.error(f"Chunk transcription failed: {e}")
+            return None
+
+    def _read_audio_file(self, path: str) -> dict | None:
+        """Read a WAV audio file and return its parameters."""
+        try:
+            with wave.open(path, "rb") as wav_file:
+                return {
+                    "sample_rate": wav_file.getframerate(),
+                    "channels": wav_file.getnchannels(),
+                    "sample_width": wav_file.getsampwidth(),
+                    "frames": wav_file.readframes(wav_file.getnframes()),
+                    "duration_seconds": wav_file.getnframes() / wav_file.getframerate(),
+                }
+        except Exception as e:
+            logger.error(f"Failed to read audio file {path}: {e}")
+            return None
+
+    async def transcribe_live(self, audio_stream):
+        """
+        Transcribe a live audio stream using Deepgram WebSocket.
+        
+        TODO: Implement Deepgram WebSocket streaming for live calls.
+        This would connect to Deepgram's real-time API and yield
+        transcript segments as they arrive.
+        """
+        pass
+
+========================================================================================================================
+FILE: app\services\voice_service.py
+========================================================================================================================
+"""
+Voice Service — Vapi Tool Call Handler (Q1)
+
+Routes Vapi function-call webhooks to the appropriate backend service:
+- search_knowledge_base → RAG Service (grounded answers with citations)
+- lookup_borrower → Mock CRM (borrower verification)
+- schedule_callback → Call Service (callback scheduling)
+- record_payment_commitment → Call Service (payment commitment)
+- escalate_to_human → Call Service (human escalation)
+- check_eligibility → Rule Engine (hardship/restructuring eligibility)
+
+Also handles:
+- status-update → Update call status, log state transitions
+- end-of-call-report → Save transcript, generate summary, log to Langfuse
+- assistant-request → Dynamic assistant configuration based on loan type/market
+"""
+
+import logging
+import json
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.services.rag_service import RAGService
+from app.services.call_service import CallService
+from app.services.rule_engine import RuleEngine
+from app.core.langfuse_client import create_trace
+
+logger = logging.getLogger(__name__)
+
+# --- Mock CRM Data (replace with real CRM integration in production) ---
+MOCK_BORROWERS = {
+    "LN001": {
+        "borrower_name": "Rajesh Kumar",
+        "loan_id": "LN001",
+        "loan_type": "personal",
+        "amount_due": 15000.00,
+        "due_date": "2025-02-15",
+        "days_until_due": 5,
+        "payment_history": "Regular payments for 18 months, one late payment in month 6",
+        "eligible_programs": ["emi_holiday", "extension"],
+    },
+    "LN002": {
+        "borrower_name": "Priya Sharma",
+        "loan_id": "LN002",
+        "loan_type": "home",
+        "amount_due": 45000.00,
+        "due_date": "2025-02-20",
+        "days_until_due": 10,
+        "payment_history": "Perfect payment record for 36 months",
+        "eligible_programs": ["restructuring", "emi_holiday"],
+    },
+    "LN003": {
+        "borrower_name": "Amit Patel",
+        "loan_id": "LN003",
+        "loan_type": "auto",
+        "amount_due": 22000.00,
+        "due_date": "2025-02-12",
+        "days_until_due": 2,
+        "payment_history": "3 late payments in last 12 months",
+        "eligible_programs": ["extension"],
+    },
+}
+
+
+class VoiceService:
+    """
+    Voice service that handles all Vapi webhook events.
+    
+    Usage:
+        service = VoiceService(db)
+        result = await service.handle_function_call(message)
+    """
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.rag = RAGService(db)
+        self.call_service = CallService(db)
+        self.rule_engine = RuleEngine(db)
+
+    async def handle_function_call(self, message: dict) -> dict:
+        """
+        Route a Vapi function-call to the appropriate handler.
+        
+        Returns the result dict that Vapi will pass back to the LLM.
+        """
+        func_call = message.get("functionCall", message.get("function_call", {}))
+        func_name = func_call.get("name", "")
+        params = func_call.get("parameters", {})
+        call_info = message.get("call", {})
+        call_id = call_info.get("id", "unknown")
+
+        logger.info(f"Function call: {func_name} for call {call_id}")
+
+        trace = create_trace(
+            name=f"tool_call_{func_name}",
+            metadata={"call_id": call_id, "params": params},
+        )
+
+        # Route to handler
+        handlers = {
+            "search_knowledge_base": self._handle_kb_search,
+            "lookup_borrower": self._handle_borrower_lookup,
+            "schedule_callback": self._handle_schedule_callback,
+            "record_payment_commitment": self._handle_payment_commitment,
+            "escalate_to_human": self._handle_escalation,
+            "check_eligibility": self._handle_eligibility_check,
+        }
+
+        handler = handlers.get(func_name)
+        if not handler:
+            logger.warning(f"Unknown function: {func_name}")
+            return {"result": f"Unknown function: {func_name}"}
+
+        result = await handler(params, call_id)
+
+        # Log event
+        await self.call_service.log_event(
+            call_id=call_id,
+            event_type="tool_call",
+            payload={"function": func_name, "params": params, "result": result},
+        )
+
+        return {"result": json.dumps(result) if isinstance(result, dict) else str(result)}
+
+    async def _handle_kb_search(self, params: dict, call_id: str) -> dict:
+        """Search knowledge base for grounded answers."""
+        query = params.get("query", "")
+        category = params.get("category")
+        return await self.rag.search_for_voice(query=query, category=category)
+
+    async def _handle_borrower_lookup(self, params: dict, call_id: str) -> dict:
+        """Look up borrower in mock CRM."""
+        name = params.get("borrower_name", "").lower()
+        loan_id = params.get("loan_id", "").upper()
+
+        # Search by loan_id first, then by name
+        if loan_id and loan_id in MOCK_BORROWERS:
+            return {"found": True, **MOCK_BORROWERS[loan_id]}
+
+        for lid, data in MOCK_BORROWERS.items():
+            if name and name in data["borrower_name"].lower():
+                return {"found": True, **data}
+
+        return {
+            "found": False,
+            "message": "Borrower not found. Please verify the name or loan ID.",
+        }
+
+    async def _handle_schedule_callback(self, params: dict, call_id: str) -> dict:
+        """Schedule a callback for the borrower."""
+        date = params.get("date", "")
+        time = params.get("time", "")
+        reason = params.get("reason", "Follow-up on payment")
+
+        # TODO: Save to database
+        return {
+            "scheduled": True,
+            "callback_date": date,
+            "callback_time": time,
+            "reason": reason,
+            "message": f"Callback scheduled for {date} at {time}.",
+        }
+
+    async def _handle_payment_commitment(self, params: dict, call_id: str) -> dict:
+        """Record a payment commitment from the borrower."""
+        commitment_date = params.get("commitment_date", "")
+        amount = params.get("amount")
+        method = params.get("payment_method", "")
+
+        # TODO: Save to database
+        return {
+            "recorded": True,
+            "commitment_date": commitment_date,
+            "amount": amount,
+            "payment_method": method,
+            "message": f"Payment commitment recorded for {commitment_date}.",
+        }
+
+    async def _handle_escalation(self, params: dict, call_id: str) -> dict:
+        """Escalate call to a human agent."""
+        reason = params.get("reason", "Customer request")
+        priority = params.get("priority", "normal")
+
+        # TODO: Trigger actual escalation (webhook, queue, etc.)
+        return {
+            "escalated": True,
+            "reason": reason,
+            "priority": priority,
+            "message": "Transferring you to a human agent now. Please hold.",
+        }
+
+    async def _handle_eligibility_check(self, params: dict, call_id: str) -> dict:
+        """Check borrower eligibility for hardship programs."""
+        loan_id = params.get("loan_id", "").upper()
+        program_type = params.get("program_type", "")
+
+        borrower = MOCK_BORROWERS.get(loan_id)
+        if not borrower:
+            return {"eligible": False, "reason": "Loan not found"}
+
+        eligible = program_type in borrower.get("eligible_programs", [])
+        return {
+            "eligible": eligible,
+            "program_type": program_type,
+            "message": f"{'Eligible' if eligible else 'Not eligible'} for {program_type} program.",
+        }
+
+    async def handle_status_update(self, message: dict):
+        """Handle Vapi status-update webhook."""
+        status = message.get("status", "")
+        call_info = message.get("call", {})
+        call_id = call_info.get("id", "unknown")
+
+        logger.info(f"Call {call_id} status: {status}")
+
+        if status == "in-progress":
+            await self.call_service.create_or_update_call(
+                external_call_id=call_id,
+                status="active",
+            )
+        elif status == "ended":
+            ended_reason = message.get("endedReason", "unknown")
+            await self.call_service.create_or_update_call(
+                external_call_id=call_id,
+                status="completed",
+                metadata={"ended_reason": ended_reason},
+            )
+
+    async def handle_end_of_call(self, message: dict):
+        """Handle Vapi end-of-call-report webhook. Save transcript and summary."""
+        call_info = message.get("call", {})
+        call_id = call_info.get("id", "unknown")
+
+        transcript = message.get("transcript", "")
+        messages = message.get("messages", [])
+        summary = message.get("summary", "")
+        recording_url = message.get("recordingUrl", "")
+        duration = message.get("durationSeconds", 0)
+
+        await self.call_service.create_or_update_call(
+            external_call_id=call_id,
+            status="completed",
+            transcript={"raw": transcript, "messages": messages},
+            summary=summary,
+            metadata={
+                "recording_url": recording_url,
+                "duration_seconds": duration,
+            },
+        )
+
+        logger.info(f"Call {call_id} completed. Duration: {duration}s")
+
+    async def handle_assistant_request(self, message: dict) -> dict:
+        """
+        Handle Vapi assistant-request webhook.
+        
+        Dynamically configure the assistant based on the incoming call context
+        (e.g., different prompts for different loan types or markets).
+        """
+        # TODO: Return dynamic assistant configuration
+        # For now, return None to use the default assistant
+        return {}
+
+    async def trigger_outbound_call(self, loan_id: str) -> dict:
+        """Trigger an outbound call via Vapi API."""
+        # TODO: Implement Vapi outbound call API
+        # POST https://api.vapi.ai/call/phone
+        return {"status": "not_implemented", "loan_id": loan_id}
+
+========================================================================================================================
+FILE: app\utils\__init__.py
+========================================================================================================================
+"""Utils Package."""
+
+========================================================================================================================
+FILE: app\utils\chunking.py
+========================================================================================================================
+"""
+Text Chunking Strategies (Q2)
+
+Implements category-aware chunking for knowledge base content.
+
+Strategy by document type:
+- FAQ entries: 1 FAQ = 1 chunk (atomic, no splitting)
+- Policy docs: 300-500 tokens, 50 token overlap
+- Objection scripts: 1 objection = 1 chunk (atomic)
+- Product info: 400-600 tokens, 75 token overlap
+- Compliance rules: 200-400 tokens, 50 token overlap
+
+Uses tiktoken for accurate token counting.
+"""
+
+import logging
+import tiktoken
+
+logger = logging.getLogger(__name__)
+
+# Token counting
+ENCODER = tiktoken.get_encoding("cl100k_base")  # GPT-4 encoding
+
+
+# Chunk size configuration per category
+CHUNK_CONFIG = {
+    "faq": {"max_tokens": 500, "overlap_tokens": 0, "atomic": True},
+    "objection": {"max_tokens": 500, "overlap_tokens": 0, "atomic": True},
+    "escalation": {"max_tokens": 400, "overlap_tokens": 0, "atomic": True},
+    "policy": {"max_tokens": 400, "overlap_tokens": 50, "atomic": False},
+    "product": {"max_tokens": 500, "overlap_tokens": 75, "atomic": False},
+    "compliance": {"max_tokens": 300, "overlap_tokens": 50, "atomic": False},
+    "payment": {"max_tokens": 400, "overlap_tokens": 50, "atomic": False},
+}
+
+DEFAULT_CONFIG = {"max_tokens": 400, "overlap_tokens": 50, "atomic": False}
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens in text using tiktoken."""
+    return len(ENCODER.encode(text))
+
+
+def chunk_text(text: str, category: str = "default") -> list[dict]:
+    """
+    Chunk text based on category-specific strategy.
+    
+    Args:
+        text: Text to chunk
+        category: KB category (faq, policy, product, etc.)
+    
+    Returns:
+        List of chunk dicts: [{text, token_count, chunk_index}]
+    """
+    config = CHUNK_CONFIG.get(category, DEFAULT_CONFIG)
+    
+    # Atomic categories: return as-is (1 record = 1 chunk)
+    if config["atomic"]:
+        return [{
+            "text": text.strip(),
+            "token_count": count_tokens(text),
+            "chunk_index": 0,
+        }]
+    
+    # Split into chunks with overlap
+    max_tokens = config["max_tokens"]
+    overlap_tokens = config["overlap_tokens"]
+    
+    # Split by paragraphs first for natural boundaries
+    paragraphs = text.split("\n\n")
+    
+    chunks = []
+    current_chunk = ""
+    current_tokens = 0
+    
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        
+        para_tokens = count_tokens(para)
+        
+        # If single paragraph exceeds max, force-split by sentences
+        if para_tokens > max_tokens:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+                current_tokens = 0
+            
+            sentence_chunks = _split_by_sentences(para, max_tokens, overlap_tokens)
+            chunks.extend(sentence_chunks)
+            continue
+        
+        # Add paragraph to current chunk if it fits
+        if current_tokens + para_tokens <= max_tokens:
+            current_chunk += "\n\n" + para if current_chunk else para
+            current_tokens += para_tokens
+        else:
+            # Save current chunk, start new one
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            
+            # Apply overlap: include tail of previous chunk
+            if overlap_tokens > 0 and chunks:
+                overlap_text = _get_overlap(chunks[-1], overlap_tokens)
+                current_chunk = overlap_text + "\n\n" + para
+                current_tokens = count_tokens(current_chunk)
+            else:
+                current_chunk = para
+                current_tokens = para_tokens
+    
+    # Don't forget the last chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    # Format output
+    return [
+        {
+            "text": chunk,
+            "token_count": count_tokens(chunk),
+            "chunk_index": i,
+        }
+        for i, chunk in enumerate(chunks)
+    ]
+
+
+def _split_by_sentences(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
+    """Split text by sentence boundaries when paragraphs are too large."""
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    
+    chunks = []
+    current = ""
+    current_tokens = 0
+    
+    for sentence in sentences:
+        sent_tokens = count_tokens(sentence)
+        if current_tokens + sent_tokens <= max_tokens:
+            current += " " + sentence if current else sentence
+            current_tokens += sent_tokens
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = sentence
+            current_tokens = sent_tokens
+    
+    if current.strip():
+        chunks.append(current.strip())
+    
+    return chunks
+
+
+def _get_overlap(text: str, overlap_tokens: int) -> str:
+    """Get the last N tokens of text as overlap."""
+    tokens = ENCODER.encode(text)
+    overlap = tokens[-overlap_tokens:] if len(tokens) > overlap_tokens else tokens
+    return ENCODER.decode(overlap)
+
+========================================================================================================================
+FILE: app\utils\latency.py
+========================================================================================================================
+"""
+Latency Measurement Utilities (Q4)
+
+Provides:
+- LatencyTracker: Per-component latency tracking
+- @measure_latency decorator for automatic timing
+- P50/P95 calculation helpers
+"""
+
+import time
+import functools
+import logging
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LatencyTracker:
+    """
+    Track latency across pipeline components.
+    
+    Usage:
+        tracker = LatencyTracker()
+        with tracker.measure("asr"):
+            result = await asr.transcribe(chunk)
+        with tracker.measure("signal"):
+            signals = await extractor.extract(transcript)
+        
+        report = tracker.get_report()
+        # {"asr": 180.5, "signal": 95.2, "total": 275.7}
+    """
+    
+    measurements: dict = field(default_factory=dict)
+    _start_times: dict = field(default_factory=dict)
+    
+    class _MeasureContext:
+        """Context manager for measuring a component."""
+        def __init__(self, tracker, component_name):
+            self.tracker = tracker
+            self.component = component_name
+            
+        def __enter__(self):
+            self.tracker._start_times[self.component] = time.time()
+            return self
+            
+        def __exit__(self, *args):
+            elapsed = (time.time() - self.tracker._start_times[self.component]) * 1000
+            if self.component not in self.tracker.measurements:
+                self.tracker.measurements[self.component] = []
+            self.tracker.measurements[self.component].append(elapsed)
+    
+    def measure(self, component_name: str):
+        """Create a context manager for measuring a component."""
+        return self._MeasureContext(self, component_name)
+    
+    def get_report(self) -> dict:
+        """Get the latest measurement for each component."""
+        report = {}
+        for component, times in self.measurements.items():
+            report[component] = round(times[-1], 2) if times else 0
+        report["total"] = round(sum(report.values()), 2)
+        return report
+    
+    def get_all_measurements(self) -> dict:
+        """Get all measurements for analysis."""
+        return self.measurements
+
+
+def calculate_percentile(values: list[float], percentile: float) -> float:
+    """
+    Calculate the Nth percentile of a list of values.
+    
+    Args:
+        values: List of numeric values
+        percentile: Percentile to calculate (0-100)
+    
+    Returns:
+        The Nth percentile value
+    """
+    if not values:
+        return 0.0
+    
+    sorted_values = sorted(values)
+    idx = int(len(sorted_values) * percentile / 100)
+    idx = min(idx, len(sorted_values) - 1)
+    return round(sorted_values[idx], 2)
+
+
+def calculate_p50_p95(values: list[float]) -> dict:
+    """Calculate P50 and P95 for a list of values."""
+    return {
+        "p50": calculate_percentile(values, 50),
+        "p95": calculate_percentile(values, 95),
+        "min": round(min(values), 2) if values else 0,
+        "max": round(max(values), 2) if values else 0,
+        "avg": round(sum(values) / len(values), 2) if values else 0,
+        "count": len(values),
+    }
+
+
+def measure_latency(component_name: str):
+    """
+    Decorator to measure function execution latency.
+    
+    Usage:
+        @measure_latency("rag_search")
+        async def search(query: str):
+            ...
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            start = time.time()
+            result = await func(*args, **kwargs)
+            elapsed_ms = (time.time() - start) * 1000
+            logger.debug(f"{component_name} latency: {elapsed_ms:.2f}ms")
+            
+            # Attach latency to result if it's a dict
+            if isinstance(result, dict):
+                result["_latency_ms"] = round(elapsed_ms, 2)
+            
+            return result
+        return wrapper
+    return decorator
+
+========================================================================================================================
+FILE: app\utils\pii.py
+========================================================================================================================
+"""
+PII Detection & Redaction — Microsoft Presidio
+
+Detects and redacts personally identifiable information (PII) in KB content.
+
+Detected entity types:
+- PERSON (names)
+- PHONE_NUMBER
+- EMAIL_ADDRESS
+- CREDIT_CARD
+- AADHAAR_NUMBER (India-specific)
+- PAN_NUMBER (India-specific — custom pattern)
+- LOCATION / ADDRESS
+
+Used during KB ingestion to:
+1. Flag records containing PII (contains_pii = True)
+2. Generate PII-redacted version (content_clean)
+"""
+
+import logging
+from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
+
+
+class PIIEntity(NamedTuple):
+    """A detected PII entity."""
+    entity_type: str
+    start: int
+    end: int
+    score: float
+    text: str
+
+
+def detect_pii(text: str, threshold: float = 0.7) -> list[PIIEntity]:
+    """
+    Detect PII entities in text using Presidio.
+    
+    Args:
+        text: Text to analyze
+        threshold: Minimum confidence score (0.0 - 1.0)
+    
+    Returns:
+        List of detected PII entities
+    """
+    try:
+        from presidio_analyzer import AnalyzerEngine
+        
+        analyzer = AnalyzerEngine()
+        results = analyzer.analyze(
+            text=text,
+            language="en",
+            entities=[
+                "PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS",
+                "CREDIT_CARD", "LOCATION",
+            ],
+            score_threshold=threshold,
+        )
+        
+        return [
+            PIIEntity(
+                entity_type=r.entity_type,
+                start=r.start,
+                end=r.end,
+                score=r.score,
+                text=text[r.start:r.end],
+            )
+            for r in results
+        ]
+    
+    except ImportError:
+        logger.warning("Presidio not installed. PII detection disabled.")
+        return []
+    except Exception as e:
+        logger.error(f"PII detection error: {e}")
+        return []
+
+
+def redact_pii(text: str, entities: list[PIIEntity] | None = None) -> str:
+    """
+    Redact PII entities from text.
+    
+    Replaces detected PII with placeholder tags:
+    - "John Smith" → "[PERSON]"
+    - "9876543210" → "[PHONE_NUMBER]"
+    """
+    if entities is None:
+        entities = detect_pii(text)
+    
+    if not entities:
+        return text
+    
+    # Sort by position (reverse) to avoid offset issues
+    sorted_entities = sorted(entities, key=lambda e: e.start, reverse=True)
+    
+    redacted = text
+    for entity in sorted_entities:
+        placeholder = f"[{entity.entity_type}]"
+        redacted = redacted[:entity.start] + placeholder + redacted[entity.end:]
+    
+    return redacted
+
+========================================================================================================================
+FILE: tests\__init__.py
+========================================================================================================================
+"""Tests Package."""
+
+========================================================================================================================
+FILE: tests\conftest.py
+========================================================================================================================
+"""Pytest configuration and PostgreSQL-backed fixtures."""
+
+import os
+
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.core.database import Base, get_db
+from app.main import app
+
+
+TEST_DATABASE_URL = os.getenv(
+    "LOI_TEST_DATABASE_URL",
+    "postgresql+asyncpg://loi_user:changeme@localhost:5432/loan_operation_intelligence_test",
+)
+
+
+@pytest_asyncio.fixture
+async def db_session():
+    """Provide an isolated PostgreSQL session for each test."""
+    if "/loan_operation_intelligence_test" not in TEST_DATABASE_URL:
+        raise RuntimeError("LOI_TEST_DATABASE_URL must target loan_operation_intelligence_test")
+
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        yield session
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def client(db_session):
+    """Create a FastAPI client with the PostgreSQL test session injected."""
+    async def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+========================================================================================================================
+FILE: tests\test_conversation_tracker.py
+========================================================================================================================
+from app.agents.conversation_tracker import check_compliance, evaluate_rules, update_phase
+
+
+def state(message: str, **updates):
+    base = {"call_id": "call-1", "messages": [{"content": message}], "current_phase": "greeting", "verification_attempts": 0, "objections_raised": [], "compliance_checklist": {}, "turn_count": 0}
+    return {**base, **updates}
+
+
+def test_detects_commitment_phase():
+    result = update_phase(state("I will pay on Friday"))
+    assert result["current_phase"] == "commit"
+    assert result["turn_count"] == 1
+
+
+def test_updates_compliance_checklist():
+    result = check_compliance(state("My name is Ana calling from LOI. This is a payment reminder and the call may be recorded."))
+    assert all(result["compliance_checklist"].values())
+
+
+def test_escalates_after_three_failed_verifications():
+    result = evaluate_rules(state("", verification_attempts=3))
+    assert result["current_phase"] == "escalate"
+
+========================================================================================================================
+FILE: tests\test_knowledge_service.py
+========================================================================================================================
+"""Tests for Knowledge Service (Q2)."""
+import pytest
+
+class TestKnowledgeService:
+    @pytest.mark.asyncio
+    async def test_ingest_single_record(self, db_session):
+        """Ingest a single KB record successfully."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_ingest_with_pii_detection(self, db_session):
+        """PII is detected and redacted during ingestion."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_chunking_long_document(self, db_session):
+        """Long documents are chunked correctly."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_crud_operations(self, db_session):
+        """Create, read, update, delete KB records."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_category_filtering(self, db_session):
+        """Records can be filtered by category."""
+        pass
+
+========================================================================================================================
+FILE: tests\test_nudge_engine.py
+========================================================================================================================
+"""Tests for Nudge Engine (Q4)."""
+import pytest
+
+class TestNudgeEngine:
+    @pytest.mark.asyncio
+    async def test_confidence_threshold_filtering(self, db_session):
+        """Nudges below confidence threshold are suppressed."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_cooldown_suppression(self, db_session):
+        """Nudges within cooldown window are suppressed."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_duplicate_suppression(self, db_session):
+        """Duplicate nudges are suppressed."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_max_per_call_limit(self, db_session):
+        """No more than MAX_NUDGES_PER_CALL are delivered."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_latency_tracking(self, db_session):
+        """Latency is measured for each component."""
+        pass
+
+========================================================================================================================
+FILE: tests\test_rag_service.py
+========================================================================================================================
+"""Tests for RAG Service (Q2 evaluation)."""
+
+import pytest
+import pytest_asyncio
+
+
+class TestRAGService:
+    """Test suite for RAG retrieval quality."""
+
+    @pytest.mark.asyncio
+    async def test_search_returns_results(self, client):
+        """Test that search returns results for a valid query."""
+        # TODO: Seed KB, then search
+        pass
+
+    @pytest.mark.asyncio
+    async def test_search_with_category_filter(self, client):
+        """Test that category filter works correctly."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_search_relevance_ranking(self, client):
+        """Test that results are ranked by relevance."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_search_no_results_graceful(self, client):
+        """Test graceful handling when no results match."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_search_with_citations(self, client):
+        """Test that results include source citations."""
+        pass
+
+========================================================================================================================
+FILE: tests\test_rule_engine.py
+========================================================================================================================
+"""Tests for Rule Engine."""
+import pytest
+
+class TestRuleEngine:
+    @pytest.mark.asyncio
+    async def test_escalation_on_max_objections(self, db_session):
+        """Escalation triggers after 3+ unresolved objections."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_escalation_on_failed_verification(self, db_session):
+        """Escalation triggers after 3 failed verification attempts."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_compliance_disclosure_check(self, db_session):
+        """Compliance rule detects missing disclosures."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_compound_and_condition(self, db_session):
+        """Compound AND condition evaluates correctly."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_compound_or_condition(self, db_session):
+        """Compound OR condition evaluates correctly."""
+        pass
+
+========================================================================================================================
+FILE: tests\test_voice_service.py
+========================================================================================================================
+"""Tests for Voice Service (Q1)."""
+import pytest
+
+class TestVoiceService:
+    @pytest.mark.asyncio
+    async def test_borrower_lookup_by_loan_id(self, db_session):
+        """Borrower found by loan ID."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_borrower_lookup_not_found(self, db_session):
+        """Graceful handling of unknown borrower."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_schedule_callback(self, db_session):
+        """Callback scheduling returns confirmation."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_escalation(self, db_session):
+        """Escalation returns proper response."""
+        pass
+
+    @pytest.mark.asyncio
+    async def test_kb_search_fallback(self, db_session):
+        """KB search returns safe fallback when no results."""
+        pass
+
+========================================================================================================================
+FILE: alembic\versions\89f65426f474_initial_schema.py
+========================================================================================================================
+"""Initial schema
+
+Revision ID: 89f65426f474
+Revises: 
+Create Date: 2026-07-18 18:15:56.131494
+
+"""
+
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+from sqlalchemy.dialects import postgresql
+
+# revision identifiers, used by Alembic.
+revision: str = '89f65426f474'
+down_revision: Union[str, None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table('business_rules',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('rule_id', sa.String(length=100), nullable=False, comment='Human-readable ID, e.g., rule_escalation_001'),
+    sa.Column('name', sa.String(length=200), nullable=False),
+    sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('category', sa.String(length=50), nullable=False, comment='escalation | compliance | qualification | payment'),
+    sa.Column('rule_type', sa.String(length=50), nullable=False, comment='threshold | pattern | schedule | checklist'),
+    sa.Column('condition', postgresql.JSONB(astext_type=sa.Text()), nullable=False, comment='Declarative condition, e.g., {"field": "objection_count", "operator": "gte", "value": 3}'),
+    sa.Column('action', postgresql.JSONB(astext_type=sa.Text()), nullable=False, comment='Action to take, e.g., {"type": "escalate", "reason": "Multiple unresolved objections"}'),
+    sa.Column('priority', sa.Integer(), nullable=False, comment='Higher priority = evaluated first'),
+    sa.Column('active', sa.Boolean(), nullable=False),
+    sa.Column('market', sa.String(length=20), nullable=False, comment='all | india | philippines | indonesia'),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_business_rules_category'), 'business_rules', ['category'], unique=False)
+    op.create_index(op.f('ix_business_rules_rule_id'), 'business_rules', ['rule_id'], unique=True)
+    op.create_table('calls',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('external_call_id', sa.String(length=200), nullable=True, comment='Vapi call ID'),
+    sa.Column('borrower_name', sa.String(length=200), nullable=True),
+    sa.Column('loan_id', sa.String(length=100), nullable=True),
+    sa.Column('loan_type', sa.String(length=50), nullable=True, comment='personal | home | auto | business'),
+    sa.Column('language', sa.String(length=10), nullable=False),
+    sa.Column('status', sa.String(length=20), nullable=False, comment='active | completed | escalated | failed'),
+    sa.Column('outcome', sa.String(length=50), nullable=True, comment='commitment | callback | escalation | refused | no_answer'),
+    sa.Column('payment_due_date', sa.Date(), nullable=True),
+    sa.Column('amount_due', sa.Numeric(precision=12, scale=2), nullable=True),
+    sa.Column('commitment_date', sa.Date(), nullable=True, comment='Date borrower committed to pay'),
+    sa.Column('callback_scheduled', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('transcript', postgresql.JSONB(astext_type=sa.Text()), nullable=True, comment='Full conversation transcript as JSON'),
+    sa.Column('summary', sa.Text(), nullable=True, comment='LLM-generated call summary'),
+    sa.Column('sentiment_score', sa.Numeric(precision=3, scale=2), nullable=True, comment='Overall call sentiment (-1.0 to 1.0)'),
+    sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), nullable=True, comment='duration_seconds, agent_id, recording_url, etc.'),
+    sa.Column('market', sa.String(length=20), nullable=False, comment='india | philippines | indonesia'),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_calls_external_call_id'), 'calls', ['external_call_id'], unique=True)
+    op.create_index(op.f('ix_calls_loan_id'), 'calls', ['loan_id'], unique=False)
+    op.create_table('kb_records',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('record_id', sa.String(length=100), nullable=False, comment='Human-readable ID, e.g., kb_loan_policy_001'),
+    sa.Column('title', sa.String(length=500), nullable=False),
+    sa.Column('content', sa.Text(), nullable=False),
+    sa.Column('content_clean', sa.Text(), nullable=True, comment='PII-redacted version of content'),
+    sa.Column('category', sa.String(length=50), nullable=False, comment='product | policy | faq | objection | compliance | payment | escalation'),
+    sa.Column('subcategory', sa.String(length=100), nullable=True),
+    sa.Column('source', sa.String(length=50), nullable=False, comment='website | pdf | manual | csv'),
+    sa.Column('source_url', sa.String(length=1000), nullable=True),
+    sa.Column('version', sa.String(length=20), nullable=False),
+    sa.Column('contains_pii', sa.Boolean(), nullable=False),
+    sa.Column('metadata', postgresql.JSONB(astext_type=sa.Text()), nullable=True, comment='tags, language, product_type, applicable_market, etc.'),
+    sa.Column('chunk_id', sa.String(length=100), nullable=True, comment='Chunk identifier within parent doc'),
+    sa.Column('parent_doc_id', sa.String(length=100), nullable=True, comment='Links chunk to parent document'),
+    sa.Column('embedding_id', sa.String(length=200), nullable=True, comment='Pinecone vector ID'),
+    sa.Column('token_count', sa.Integer(), nullable=True),
+    sa.Column('language', sa.String(length=10), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_kb_records_category'), 'kb_records', ['category'], unique=False)
+    op.create_index(op.f('ix_kb_records_parent_doc_id'), 'kb_records', ['parent_doc_id'], unique=False)
+    op.create_index(op.f('ix_kb_records_record_id'), 'kb_records', ['record_id'], unique=True)
+    op.create_table('call_events',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('call_id', sa.UUID(), nullable=False),
+    sa.Column('event_type', sa.String(length=50), nullable=False, comment='state_change | tool_call | rag_query | escalation | error | compliance_check'),
+    sa.Column('from_state', sa.String(length=50), nullable=True),
+    sa.Column('to_state', sa.String(length=50), nullable=True),
+    sa.Column('payload', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.ForeignKeyConstraint(['call_id'], ['calls.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_call_events_call_id'), 'call_events', ['call_id'], unique=False)
+    op.create_table('nudges',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('call_id', sa.UUID(), nullable=False),
+    sa.Column('signal_type', sa.String(length=50), nullable=False, comment='compliance_gap | sentiment | cross_sell | missed_opportunity | payment_difficulty | risk'),
+    sa.Column('signal_text', sa.Text(), nullable=False, comment='What was detected in the conversation'),
+    sa.Column('nudge_text', sa.Text(), nullable=False, comment='Actionable recommendation for the agent'),
+    sa.Column('confidence', sa.Float(), nullable=False, comment='Confidence score 0.0 - 1.0'),
+    sa.Column('priority', sa.String(length=20), nullable=False, comment='critical | high | medium | low'),
+    sa.Column('displayed', sa.Boolean(), nullable=False, comment='Was this nudge shown to the agent'),
+    sa.Column('suppressed', sa.Boolean(), nullable=False, comment='Was this nudge filtered out by controls'),
+    sa.Column('suppression_reason', sa.String(length=100), nullable=True, comment='duplicate | cooldown | low_confidence | max_per_call | expired'),
+    sa.Column('latency_ms', postgresql.JSONB(astext_type=sa.Text()), nullable=True, comment='{"asr": 180, "signal": 95, "llm": 320, "delivery": 15, "total": 610}'),
+    sa.Column('transcript_position', sa.Integer(), nullable=True, comment='Word offset in transcript when signal was detected'),
+    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.ForeignKeyConstraint(['call_id'], ['calls.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_nudges_call_id'), 'nudges', ['call_id'], unique=False)
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(op.f('ix_nudges_call_id'), table_name='nudges')
+    op.drop_table('nudges')
+    op.drop_index(op.f('ix_call_events_call_id'), table_name='call_events')
+    op.drop_table('call_events')
+    op.drop_index(op.f('ix_kb_records_record_id'), table_name='kb_records')
+    op.drop_index(op.f('ix_kb_records_parent_doc_id'), table_name='kb_records')
+    op.drop_index(op.f('ix_kb_records_category'), table_name='kb_records')
+    op.drop_table('kb_records')
+    op.drop_index(op.f('ix_calls_loan_id'), table_name='calls')
+    op.drop_index(op.f('ix_calls_external_call_id'), table_name='calls')
+    op.drop_table('calls')
+    op.drop_index(op.f('ix_business_rules_rule_id'), table_name='business_rules')
+    op.drop_index(op.f('ix_business_rules_category'), table_name='business_rules')
+    op.drop_table('business_rules')
+    # ### end Alembic commands ###
+
+========================================================================================================================
+FILE: alembic.ini
+========================================================================================================================
+# Alembic Configuration
+
+[alembic]
+script_location = alembic
+sqlalchemy.url = postgresql+asyncpg://loi_user:changeme@localhost:5432/loan_operation_intelligence
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+========================================================================================================================
+FILE: requirements.txt
+========================================================================================================================
+# === Core ===
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+python-multipart==0.0.20
+
+# === Database ===
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.1
+greenlet==3.1.1
+
+# === Redis ===
+redis[hiredis]==5.2.1
+
+# === Vector DB ===
+pinecone-client==5.0.1
+
+# === LLM / Embeddings ===
+openai==1.59.7
+langchain-openai==0.3.0
+langchain-core==0.3.30
+langgraph==0.2.60
+
+# === Voice Platform ===
+# Vapi is API-only, no SDK needed (HTTP calls)
+httpx==0.28.1
+
+# === Streaming ASR (Q4) ===
+deepgram-sdk==3.8.0 
+
+# === Observability ===
+langfuse==2.57.4
+
+# === PII Detection ===
+presidio-analyzer==2.2.356
+presidio-anonymizer==2.2.356
+
+# === Data Processing ===
+beautifulsoup4==4.12.3
+pypdf==5.1.0
+tiktoken==0.8.0
+pandas==2.2.3
+
+# === Testing ===
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+httpx==0.28.1
+
+# === Dev ===
+ruff==0.8.6
+
+========================================================================================================================
+FILE: alembic\env.py
+========================================================================================================================
+"""
+Alembic Environment Configuration — Async Support
+
+Configures Alembic to use async SQLAlchemy engine
+and auto-detects models from app.models for autogenerate.
+"""
+import os
+import sys
+import asyncio
+from logging.config import fileConfig
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from sqlalchemy import pool
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from alembic import context
+
+from app.config import settings
+from app.core.database import Base
+
+# Import all models so Alembic can detect them
+from app.models import *  # noqa: F401, F403
+
+config = context.config
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode."""
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def do_run_migrations(connection):
+    context.configure(connection=connection, target_metadata=target_metadata)
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_async_migrations() -> None:
+    """Run migrations in 'online' mode with async engine."""
+    connectable = create_async_engine(
+        settings.DATABASE_URL,
+        poolclass=pool.NullPool,
+    )
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+    await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+    asyncio.run(run_async_migrations())
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
