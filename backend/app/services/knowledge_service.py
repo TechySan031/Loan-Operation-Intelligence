@@ -68,6 +68,21 @@ class KnowledgeService:
 
         for record in records:
             try:
+                # Idempotency: Clean up existing database chunks and Pinecone vectors for this document
+                existing_query = select(KBRecord).where(KBRecord.parent_doc_id == record.record_id)
+                existing_result = await self.db.execute(existing_query)
+                existing_records = existing_result.scalars().all()
+                if existing_records:
+                    logger.info(f"Idempotency Cleanup: Removing {len(existing_records)} existing chunks for '{record.record_id}'...")
+                    vids_to_delete = [r.embedding_id for r in existing_records if r.embedding_id]
+                    if vids_to_delete:
+                        try:
+                            delete_vectors(vids_to_delete)
+                        except Exception as pe:
+                            logger.warning(f"Failed to delete old Pinecone vectors for '{record.record_id}': {pe}")
+                    for r in existing_records:
+                        await self.db.delete(r)
+
                 # Stage 1: PII Detection
                 logger.info(f"PII detection: Checking record '{record.record_id}'...")
                 contains_pii = False
