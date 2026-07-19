@@ -38,13 +38,17 @@ async def ingest_records(
     
     Pipeline: validate → PII detect → chunk → embed → store in Postgres + Pinecone
     """
-    service = KnowledgeService(db)
-    result = await service.ingest_records(
-        records=request.records,
-        embed=request.embed,
-        detect_pii_flag=request.detect_pii,
-    )
-    return result
+    try:
+        service = KnowledgeService(db)
+        result = await service.ingest_records(
+            records=request.records,
+            embed=request.embed,
+            detect_pii_flag=request.detect_pii,
+        )
+        return result
+    except Exception as e:
+        logger.exception("Ingestion failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/search", response_model=KBSearchResponse)
