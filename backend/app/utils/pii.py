@@ -39,9 +39,17 @@ def _get_analyzer():
     """Get or initialize the process-wide Presidio AnalyzerEngine singleton."""
     global _analyzer
     if _analyzer is None:
-        from presidio_analyzer import AnalyzerEngine
-        logger.info("Initializing Presidio AnalyzerEngine (loading SpaCy model)...")
-        _analyzer = AnalyzerEngine()
+        from presidio_analyzer import AnalyzerEngine, NlpEngineProvider
+        logger.info("Initializing Presidio AnalyzerEngine (loading small SpaCy model en_core_web_sm)...")
+        
+        # Explicitly configure Presidio to use the small SpaCy model to prevent container OOM
+        nlp_config = {
+            "nlp_engine_name": "spacy",
+            "models": [{"project_code": "en", "model_name": "en_core_web_sm"}],
+        }
+        provider = NlpEngineProvider(nlp_config=nlp_config)
+        nlp_engine = provider.create_engine()
+        _analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
         logger.info("Presidio AnalyzerEngine initialized successfully.")
     return _analyzer
 

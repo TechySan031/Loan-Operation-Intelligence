@@ -9,9 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Configure HuggingFace cache directory inside the workspace for persistent, read-accessible caching
+ENV HF_HOME=/app/.cache/huggingface
+
 # Pre-download and cache embedding and SpaCy models to speed up runtime container initialization
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')" \
-    && python -m spacy download en_core_web_lg
+    && python -m spacy download en_core_web_sm
 
 COPY . .
 
