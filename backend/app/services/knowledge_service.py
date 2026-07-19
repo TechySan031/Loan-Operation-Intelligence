@@ -82,6 +82,7 @@ class KnowledgeService:
                             logger.warning(f"Failed to delete old Pinecone vectors for '{record.record_id}': {pe}")
                     for r in existing_records:
                         await self.db.delete(r)
+                    await self.db.flush()
 
                 # Stage 1: PII Detection
                 logger.info(f"PII detection: Checking record '{record.record_id}'...")
