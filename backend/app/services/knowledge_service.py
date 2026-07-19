@@ -55,25 +55,30 @@ class KnowledgeService:
         
         Returns summary: {ingested: int, chunks_created: int, pii_flagged: int, errors: list}
         """
+        logger.info("Starting Ingestion: Beginning knowledge base bulk upload...")
         ingested = 0
         chunks_created = 0
         pii_flagged = 0
         errors = []
         vectors_to_upsert = []
+        
+        db_records = []
+        texts_to_embed = []
+        chunk_mappings = []
 
         for record in records:
             try:
-                # Step 1: PII Detection
+                # Stage 1: PII Detection
+                logger.info(f"PII detection: Checking record '{record.record_id}'...")
                 contains_pii = False
-                content_clean = record.content
                 if detect_pii_flag:
                     pii_results = detect_pii(record.content)
                     if pii_results:
                         contains_pii = True
-                        content_clean = redact_pii(record.content, pii_results)
                         pii_flagged += 1
 
-                # Step 2: Chunk content
+                # Stage 2: Chunking
+                logger.info(f"Chunking: Splitting record '{record.record_id}'...")
                 chunks = chunk_text(
                     text=record.content,
                     category=record.category,
@@ -83,13 +88,19 @@ class KnowledgeService:
                     chunk_record_id = f"{record.record_id}_chunk_{i}" if len(chunks) > 1 else record.record_id
                     embedding_id = f"vec_{chunk_record_id}"
 
-                    # Step 3: Create DB record
+                    # Run chunk-level PII detection/redaction only if the parent contains PII
+                    chunk_content_clean = chunk["text"]
+                    if contains_pii:
+                        chunk_pii_results = detect_pii(chunk["text"])
+                        chunk_content_clean = redact_pii(chunk["text"], chunk_pii_results)
+
+                    # Stage 3: DB Record creation (staged in list)
                     db_record = KBRecord(
                         id=uuid.uuid4(),
                         record_id=chunk_record_id,
                         title=record.title,
                         content=chunk["text"],
-                        content_clean=redact_pii(chunk["text"], detect_pii(chunk["text"])) if contains_pii else chunk["text"],
+                        content_clean=chunk_content_clean,
                         category=record.category,
                         subcategory=record.subcategory,
                         source=record.source,
@@ -103,41 +114,88 @@ class KnowledgeService:
                         token_count=chunk["token_count"],
                         language=record.language,
                     )
-                    self.db.add(db_record)
+                    db_records.append(db_record)
                     chunks_created += 1
 
-                    # Step 4: Prepare vector for Pinecone
                     if embed:
-                        embedding = await self.rag.embed_text(chunk["text"])
-                        vectors_to_upsert.append({
-                            "id": embedding_id,
-                            "values": embedding,
-                            "metadata": {
-                                "record_id": chunk_record_id,
-                                "title": record.title,
-                                "content": chunk["text"][:500],  # Preview
-                                "category": record.category,
-                                "subcategory": record.subcategory or "",
-                                "source": record.source,
-                                "source_url": record.source_url or "",
-                                "language": record.language,
-                                "product_type": record.metadata.get("product_type", []) if record.metadata else [],
-                                "applicable_market": record.metadata.get("applicable_market", "all") if record.metadata else "all",
-                            },
+                        texts_to_embed.append(chunk["text"])
+                        chunk_mappings.append({
+                            "embedding_id": embedding_id,
+                            "chunk_record_id": chunk_record_id,
+                            "title": record.title,
+                            "chunk_text": chunk["text"],
+                            "category": record.category,
+                            "subcategory": record.subcategory,
+                            "source": record.source,
+                            "source_url": record.source_url,
+                            "language": record.language,
+                            "metadata": record.metadata,
                         })
 
                 ingested += 1
 
             except Exception as e:
                 errors.append({"record_id": record.record_id, "error": str(e)})
-                logger.error(f"Failed to ingest {record.record_id}: {e}")
+                logger.error(f"Failed to process record {record.record_id} during staging: {e}", exc_info=True)
 
-        # Step 5: Commit to DB
-        await self.db.flush()
+        # Stage 4: Embedding (Batch call)
+        if embed and texts_to_embed:
+            logger.info(f"Embedding: Generating embeddings for {len(texts_to_embed)} chunks in batch...")
+            try:
+                embeddings = await self.rag.embed_batch(texts_to_embed)
+                
+                for mapping, embedding in zip(chunk_mappings, embeddings):
+                    vectors_to_upsert.append({
+                        "id": mapping["embedding_id"],
+                        "values": embedding,
+                        "metadata": {
+                            "record_id": mapping["chunk_record_id"],
+                            "title": mapping["title"],
+                            "content": mapping["chunk_text"][:500],  # Preview
+                            "category": mapping["category"],
+                            "subcategory": mapping["subcategory"] or "",
+                            "source": mapping["source"],
+                            "source_url": mapping["source_url"] or "",
+                            "language": mapping["language"],
+                            "product_type": mapping["metadata"].get("product_type", []) if mapping["metadata"] else [],
+                            "applicable_market": mapping["metadata"].get("applicable_market", "all") if mapping["metadata"] else "all",
+                        },
+                    })
+            except Exception as e:
+                logger.error(f"Embedding failed: {e}", exc_info=True)
+                raise Exception(f"Batch embedding generation failed: {str(e)}")
 
-        # Step 6: Upsert vectors to Pinecone
+        # Add staged records to session
+        if db_records:
+            for rec in db_records:
+                self.db.add(rec)
+
+        # Stage 5: DB Flush
+        logger.info("DB Flush: Flushing records to database...")
+        try:
+            await self.db.flush()
+        except Exception as e:
+            logger.error(f"DB Flush failed: {e}", exc_info=True)
+            raise Exception(f"Database flush failed: {str(e)}")
+
+        # Stage 6: DB Commit
+        logger.info("DB Commit: Committing database transaction...")
+        try:
+            await self.db.commit()
+        except Exception as e:
+            logger.error(f"DB Commit failed: {e}", exc_info=True)
+            raise Exception(f"Database commit failed: {str(e)}")
+
+        # Stage 7: Pinecone Upsert
         if vectors_to_upsert:
-            upsert_vectors(vectors_to_upsert)
+            logger.info(f"Pinecone Upsert: Upserting {len(vectors_to_upsert)} vectors to index...")
+            try:
+                upsert_vectors(vectors_to_upsert)
+            except Exception as e:
+                logger.error(f"Pinecone Upsert failed: {e}", exc_info=True)
+                raise Exception(f"Pinecone vector upsert failed: {str(e)}")
+
+        logger.info("Finished: Ingestion pipeline completed successfully.")
 
         return {
             "ingested": ingested,

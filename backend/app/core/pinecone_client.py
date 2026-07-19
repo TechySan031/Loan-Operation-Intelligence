@@ -8,9 +8,12 @@ Provides:
 - Used by RAG service for knowledge base retrieval
 """
 
+import logging
 from pinecone import Pinecone, ServerlessSpec
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # --- Global Client ---
@@ -22,22 +25,37 @@ def init_pinecone():
     """Initialize Pinecone client and ensure index exists. Called on app startup."""
     global pc, index
 
-    pc = Pinecone(api_key=settings.PINECONE_API_KEY)
+    try:
+        pc = Pinecone(api_key=settings.PINECONE_API_KEY)
 
-    # Create index if it doesn't exist
-    existing_indexes = [idx.name for idx in pc.list_indexes()]
-    if settings.PINECONE_INDEX_NAME not in existing_indexes:
-        pc.create_index(
-            name=settings.PINECONE_INDEX_NAME,
-            dimension=384, # BAAI/bge-small-en-v1.5 dimension
-            metric="cosine",
-            spec=ServerlessSpec(
-                cloud="aws",
-                region=settings.PINECONE_ENVIRONMENT,
-            ),
-        )
+        # Create index if it doesn't exist
+        existing_indexes = [idx.name for idx in pc.list_indexes()]
+        if settings.PINECONE_INDEX_NAME not in existing_indexes:
+            logger.info(f"Index '{settings.PINECONE_INDEX_NAME}' not found. Attempting to create it...")
+            try:
+                pc.create_index(
+                    name=settings.PINECONE_INDEX_NAME,
+                    dimension=384, # BAAI/bge-small-en-v1.5 dimension
+                    metric="cosine",
+                    spec=ServerlessSpec(
+                        cloud="aws",
+                        region=settings.PINECONE_ENVIRONMENT,
+                    ),
+                )
+                logger.info(f"Successfully created Pinecone index: {settings.PINECONE_INDEX_NAME}")
+            except Exception as ce:
+                logger.error(f"Failed to create Pinecone index '{settings.PINECONE_INDEX_NAME}': {ce}")
+                # Refresh list and check again. If it was created by another worker/race, it's fine.
+                existing_indexes = [idx.name for idx in pc.list_indexes()]
+                if settings.PINECONE_INDEX_NAME not in existing_indexes:
+                    raise ce
 
-    index = pc.Index(settings.PINECONE_INDEX_NAME)
+        index = pc.Index(settings.PINECONE_INDEX_NAME)
+        logger.info(f"✅ Successfully bound to Pinecone index: {settings.PINECONE_INDEX_NAME}")
+    except Exception as e:
+        logger.error(f"❌ Pinecone initialization failed: {e}")
+        index = None
+        raise e
 
 
 def get_pinecone_index():

@@ -32,6 +32,20 @@ class PIIEntity(NamedTuple):
     text: str
 
 
+_analyzer = None
+
+
+def _get_analyzer():
+    """Get or initialize the process-wide Presidio AnalyzerEngine singleton."""
+    global _analyzer
+    if _analyzer is None:
+        from presidio_analyzer import AnalyzerEngine
+        logger.info("Initializing Presidio AnalyzerEngine (loading SpaCy model)...")
+        _analyzer = AnalyzerEngine()
+        logger.info("Presidio AnalyzerEngine initialized successfully.")
+    return _analyzer
+
+
 def detect_pii(text: str, threshold: float = 0.7) -> list[PIIEntity]:
     """
     Detect PII entities in text using Presidio.
@@ -44,9 +58,7 @@ def detect_pii(text: str, threshold: float = 0.7) -> list[PIIEntity]:
         List of detected PII entities
     """
     try:
-        from presidio_analyzer import AnalyzerEngine
-        
-        analyzer = AnalyzerEngine()
+        analyzer = _get_analyzer()
         results = analyzer.analyze(
             text=text,
             language="en",
