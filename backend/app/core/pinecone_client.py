@@ -30,28 +30,35 @@ def init_pinecone():
 
         # Create index if it doesn't exist
         existing_indexes = [idx.name for idx in pc.list_indexes()]
-        if settings.PINECONE_INDEX_NAME not in existing_indexes:
-            logger.info(f"Index '{settings.PINECONE_INDEX_NAME}' not found. Attempting to create it...")
-            try:
-                pc.create_index(
-                    name=settings.PINECONE_INDEX_NAME,
-                    dimension=384, # BAAI/bge-small-en-v1.5 dimension
-                    metric="cosine",
-                    spec=ServerlessSpec(
-                        cloud="aws",
-                        region=settings.PINECONE_ENVIRONMENT,
-                    ),
-                )
-                logger.info(f"Successfully created Pinecone index: {settings.PINECONE_INDEX_NAME}")
-            except Exception as ce:
-                logger.error(f"Failed to create Pinecone index '{settings.PINECONE_INDEX_NAME}': {ce}")
-                # Refresh list and check again. If it was created by another worker/race, it's fine.
-                existing_indexes = [idx.name for idx in pc.list_indexes()]
-                if settings.PINECONE_INDEX_NAME not in existing_indexes:
-                    raise ce
+        
+        active_index_name = settings.PINECONE_INDEX_NAME
+        if active_index_name not in existing_indexes:
+            # Self-healing fallback to 'loan-kb' if it exists
+            if "loan-kb" in existing_indexes:
+                logger.warning(f"Configured Pinecone index '{active_index_name}' not found, but 'loan-kb' exists. Falling back to 'loan-kb'.")
+                active_index_name = "loan-kb"
+            else:
+                logger.info(f"Index '{active_index_name}' not found. Attempting to create it...")
+                try:
+                    pc.create_index(
+                        name=active_index_name,
+                        dimension=384, # BAAI/bge-small-en-v1.5 dimension
+                        metric="cosine",
+                        spec=ServerlessSpec(
+                            cloud="aws",
+                            region=settings.PINECONE_ENVIRONMENT,
+                        ),
+                    )
+                    logger.info(f"Successfully created Pinecone index: {active_index_name}")
+                except Exception as ce:
+                    logger.error(f"Failed to create Pinecone index '{active_index_name}': {ce}")
+                    # Refresh list and check again. If it was created by another worker/race, it's fine.
+                    existing_indexes = [idx.name for idx in pc.list_indexes()]
+                    if active_index_name not in existing_indexes:
+                        raise ce
 
-        index = pc.Index(settings.PINECONE_INDEX_NAME)
-        logger.info(f"✅ Successfully bound to Pinecone index: {settings.PINECONE_INDEX_NAME}")
+        index = pc.Index(active_index_name)
+        logger.info(f"✅ Successfully bound to Pinecone index: {active_index_name}")
     except Exception as e:
         logger.error(f"❌ Pinecone initialization failed: {e}")
         index = None
