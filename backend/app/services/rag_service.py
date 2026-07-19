@@ -54,8 +54,12 @@ class RAGService:
 
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.model = _get_embedding_model()
         self.llm_model = settings.OPENAI_LLM_MODEL
+
+    @property
+    def model(self) -> SentenceTransformer:
+        """Lazy-loaded embedding model singleton."""
+        return _get_embedding_model()
 
     # ── Embedding ──────────────────────────────────────────────
 
