@@ -1,0 +1,64 @@
+[
+  {
+    "test_id": "voice_001",
+    "scenario": "cooperative_customer",
+    "description": "Customer cooperates, verifies identity, acknowledges payment, commits to pay",
+    "expected_outcome": "commitment",
+    "test_steps": [
+      "Agent greets, customer responds positively",
+      "Customer provides name and loan ID",
+      "Customer acknowledges payment reminder",
+      "Customer commits to pay by due date"
+    ]
+  },
+  {
+    "test_id": "voice_002",
+    "scenario": "objection_financial_difficulty",
+    "description": "Customer objects citing financial difficulty, agent offers assistance programs",
+    "expected_outcome": "callback",
+    "test_steps": [
+      "Agent greets, customer responds",
+      "Customer verifies identity",
+      "Customer objects: 'I lost my job, I can't pay right now'",
+      "Agent searches KB for hardship options",
+      "Agent offers EMI holiday or restructuring",
+      "Customer requests callback to discuss options"
+    ]
+  },
+  {
+    "test_id": "voice_003",
+    "scenario": "out_of_scope_question",
+    "description": "Customer asks about investment products (out of scope)",
+    "expected_outcome": "fallback",
+    "test_steps": [
+      "Agent greets, customer responds",
+      "Customer asks: 'Can you tell me about your mutual fund products?'",
+      "Agent states: information unavailable, offers to connect with team",
+      "Agent redirects to payment reminder"
+    ]
+  },
+  {
+    "test_id": "voice_004",
+    "scenario": "human_escalation_request",
+    "description": "Customer demands to speak with a human agent",
+    "expected_outcome": "escalation",
+    "test_steps": [
+      "Agent greets, customer responds",
+      "Customer: 'I want to speak with a real person'",
+      "Agent immediately honors request and escalates"
+    ]
+  },
+  {
+    "test_id": "voice_005",
+    "scenario": "conflicting_details",
+    "description": "Customer provides incorrect loan ID, then corrects",
+    "expected_outcome": "commitment",
+    "test_steps": [
+      "Agent greets, customer responds",
+      "Customer provides wrong loan ID",
+      "Agent: borrower not found, asks to verify",
+      "Customer provides correct loan ID",
+      "Verification succeeds, proceeds with reminder"
+    ]
+  }
+]

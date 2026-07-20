@@ -1,0 +1,47 @@
+[
+  {
+    "test_id": "ml_ph_001",
+    "market": "philippines",
+    "language": "taglish",
+    "scenario": "Premium reminder in Taglish",
+    "transcript_segment": "Agent: Magandang araw po! May reminder po kami about your premium payment.\nCustomer: Ah oo, yung sa insurance ko. Magkano ba yung premium ko this month?",
+    "localization_examples": [
+      "'Magandang araw po' instead of 'Good morning'",
+      "'po' and 'opo' for respect markers",
+      "Natural Taglish code-switching with insurance terms in English"
+    ]
+  },
+  {
+    "test_id": "ml_ph_002",
+    "market": "philippines",
+    "language": "filipino",
+    "scenario": "Objection handling in Filipino",
+    "objection": "Hindi ko pa kayang magbayad ngayon, pwede ba next month na lang?",
+    "expected_response_language": "Filipino with insurance terms in English",
+    "notes": "Response should use Filipino naturally, not translate English verbatim"
+  },
+  {
+    "test_id": "ml_id_001",
+    "market": "indonesia",
+    "language": "bahasa_indonesia_formal",
+    "scenario": "Installment reminder in formal Bahasa",
+    "transcript_segment": "Agent: Selamat pagi Ibu. Kami ingin mengingatkan bahwa cicilan Anda sebesar Rp 2.500.000 akan jatuh tempo pada tanggal 20 Februari.",
+    "localization_examples": [
+      "'cicilan' instead of 'installment'",
+      "'jatuh tempo' instead of 'due date'",
+      "'Ibu' as polite address form"
+    ]
+  },
+  {
+    "test_id": "ml_id_002",
+    "market": "indonesia",
+    "language": "bahasa_indonesia_colloquial",
+    "scenario": "Colloquial Indonesian with finance loanwords",
+    "transcript_segment": "Customer: Gimana ya, DP udah lunas tapi cicilan bulan ini belum bisa bayar. Bisa minta perpanjangan tenor nggak?",
+    "localization_examples": [
+      "'DP' (Down Payment) as English loanword used naturally",
+      "'tenor' as finance loanword",
+      "Colloquial 'gimana', 'udah', 'nggak' instead of formal forms"
+    ]
+  }
+]

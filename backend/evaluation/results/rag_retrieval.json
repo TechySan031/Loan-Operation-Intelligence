@@ -1,0 +1,206 @@
+{
+  "summary": {
+    "total_tests": 7,
+    "verdicts": {
+      "correct": 7,
+      "partially_correct": 0,
+      "incorrect": 0,
+      "error": 0
+    },
+    "accuracy": 1.0,
+    "partial_or_better": 1.0,
+    "avg_retrieval_time_ms": 474.33
+  },
+  "results": [
+    {
+      "test_id": "rag_001",
+      "query": "What is the late payment penalty for a personal loan?",
+      "description": "Policy question about late payment fees",
+      "expected_category": "policy",
+      "expected_keywords": [
+        "late payment",
+        "penalty",
+        "2%",
+        "overdue"
+      ],
+      "matched_keywords": [
+        "late payment",
+        "penalty",
+        "2%",
+        "overdue"
+      ],
+      "match_ratio": 1.0,
+      "verdict": "correct",
+      "top_result": {
+        "record_id": "kb_policy_001",
+        "title": "Late Payment Penalty",
+        "relevance_score": 0.8006,
+        "source": "loan_policy_document",
+        "content_preview": "If an EMI is overdue, a late payment penalty of 2% per month is charged on the overdue amount. Additional fees may apply based on the loan agreement."
+      },
+      "total_results": 3,
+      "retrieval_time_ms": 1236.13
+    },
+    {
+      "test_id": "rag_002",
+      "query": "What payment methods are available for EMI payment?",
+      "description": "FAQ about EMI payment methods",
+      "expected_category": "payment",
+      "expected_keywords": [
+        "online",
+        "bank transfer",
+        "UPI",
+        "auto-debit"
+      ],
+      "matched_keywords": [
+        "online",
+        "bank transfer",
+        "UPI",
+        "auto-debit"
+      ],
+      "match_ratio": 1.0,
+      "verdict": "correct",
+      "top_result": {
+        "record_id": "kb_payment_001",
+        "title": "EMI Payment Methods",
+        "relevance_score": 0.7857,
+        "source": "loan_policy_document",
+        "content_preview": "Customers can pay EMIs using online banking, bank transfer, UPI, debit card, auto-debit, NEFT, RTGS or by visiting the nearest branch."
+      },
+      "total_results": 3,
+      "retrieval_time_ms": 339.57
+    },
+    {
+      "test_id": "rag_003",
+      "query": "I cannot afford to pay this month, what are my options?",
+      "description": "Objection handling for financial difficulty",
+      "expected_category": "objection",
+      "expected_keywords": [
+        "hardship",
+        "restructuring",
+        "EMI holiday"
+      ],
+      "matched_keywords": [
+        "restructuring",
+        "EMI holiday"
+      ],
+      "match_ratio": 0.67,
+      "verdict": "correct",
+      "top_result": {
+        "record_id": "kb_objection_financial_difficulty_001",
+        "title": "Handling Financial Difficulty Objection",
+        "relevance_score": 0.7231,
+        "source": "manual",
+        "content_preview": "When a borrower expresses financial difficulty, respond with empathy: 'I understand you're going through a challenging time. We have several options that may help.' Available options include: 1) EMI H"
+      },
+      "total_results": 3,
+      "retrieval_time_ms": 360.69
+    },
+    {
+      "test_id": "rag_004",
+      "query": "What happens if my loan becomes NPA?",
+      "description": "Policy question about NPA classification",
+      "expected_category": "policy",
+      "expected_keywords": [
+        "NPA",
+        "non-performing",
+        "90 days",
+        "overdue"
+      ],
+      "matched_keywords": [
+        "NPA",
+        "non-performing",
+        "90 days",
+        "overdue"
+      ],
+      "match_ratio": 1.0,
+      "verdict": "correct",
+      "top_result": {
+        "record_id": "kb_policy_002",
+        "title": "Non-Performing Asset Policy",
+        "relevance_score": 0.7882,
+        "source": "loan_policy_document",
+        "content_preview": "A loan is classified as a Non-Performing Asset (NPA) if installments remain overdue for more than 90 days. An NPA classification may negatively affect the customer's credit score and future borrowing "
+      },
+      "total_results": 3,
+      "retrieval_time_ms": 360.5
+    },
+    {
+      "test_id": "rag_005",
+      "query": "How do I prepay my home loan?",
+      "description": "Product question about home loan prepayment",
+      "expected_category": "product",
+      "expected_keywords": [
+        "prepay",
+        "home loan",
+        "foreclosure"
+      ],
+      "matched_keywords": [
+        "prepay",
+        "home loan",
+        "foreclosure"
+      ],
+      "match_ratio": 1.0,
+      "verdict": "correct",
+      "top_result": {
+        "record_id": "kb_product_001",
+        "title": "Home Loan Prepayment",
+        "relevance_score": 0.7753,
+        "source": "loan_policy_document",
+        "content_preview": "Customers may prepay or foreclose their home loan before maturity. Foreclosure charges, if applicable, depend on the loan agreement and regulatory guidelines."
+      },
+      "total_results": 3,
+      "retrieval_time_ms": 328.5
+    },
+    {
+      "test_id": "rag_006",
+      "query": "I want to file a complaint about the service",
+      "description": "Escalation trigger \u00e2\u20ac\u201d complaint handling",
+      "expected_category": "escalation",
+      "expected_keywords": [
+        "complaint",
+        "grievance"
+      ],
+      "matched_keywords": [
+        "complaint",
+        "grievance"
+      ],
+      "match_ratio": 1.0,
+      "verdict": "correct",
+      "top_result": {
+        "record_id": "kb_escalation_001",
+        "title": "Complaint and Grievance Handling",
+        "relevance_score": 0.7284,
+        "source": "loan_policy_document",
+        "content_preview": "Customers may register a complaint through customer care, email, or the grievance portal. Unresolved complaints can be escalated to the grievance officer."
+      },
+      "total_results": 2,
+      "retrieval_time_ms": 355.3
+    },
+    {
+      "test_id": "rag_007",
+      "query": "Is there a grace period for my payment?",
+      "description": "FAQ about grace period",
+      "expected_category": "policy",
+      "expected_keywords": [
+        "grace period",
+        "3 days"
+      ],
+      "matched_keywords": [
+        "grace period",
+        "3 days"
+      ],
+      "match_ratio": 1.0,
+      "verdict": "correct",
+      "top_result": {
+        "record_id": "kb_policy_grace_period_001",
+        "title": "Grace Period Policy",
+        "relevance_score": 0.8128,
+        "source": "pdf",
+        "content_preview": "A grace period of 3 calendar days is provided after the EMI due date. No late payment fee is charged if the payment is received within this grace period. However, this grace period does not extend to "
+      },
+      "total_results": 3,
+      "retrieval_time_ms": 339.6
+    }
+  ]
+}

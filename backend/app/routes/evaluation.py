@@ -20,11 +20,30 @@ from app.services.rag_service import RAGService
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Path to test cases
-TEST_CASES_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-    "evaluation", "test_cases",
-)
+# Robust lookup for test cases directory in both local development and Docker container environments
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+TEST_CASES_DIR = None
+
+for _ in range(5):
+    # Try finding evaluation folder relative to the current search level
+    _candidate_in_app = os.path.join(_current_dir, "evaluation", "test_cases")
+    if os.path.exists(_candidate_in_app):
+        TEST_CASES_DIR = _candidate_in_app
+        break
+    
+    # Try finding evaluation folder as a sibling (for local development inside backend/app)
+    _candidate_sibling = os.path.join(_current_dir, "..", "evaluation", "test_cases")
+    if os.path.exists(_candidate_sibling):
+        TEST_CASES_DIR = os.path.abspath(_candidate_sibling)
+        break
+        
+    _current_dir = os.path.dirname(_current_dir)
+
+if not TEST_CASES_DIR:
+    # Default fallback to container absolute path
+    TEST_CASES_DIR = "/app/evaluation/test_cases"
+
+logger.info(f"Resolved evaluation TEST_CASES_DIR to: {TEST_CASES_DIR}")
 
 
 @router.post("/run")
