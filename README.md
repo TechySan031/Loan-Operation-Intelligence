@@ -73,6 +73,48 @@ This platform resolves that tension with a knowledge-grounded voice agent: a Vap
 
 The result is a system designed the way a fintech engineering team would actually build it: grounded answers over confident guesses, measurable retrieval quality over vibes, and safe failure modes (explicit "I don't know, let me connect you with a team member") over silent hallucination.
 
+## 🖼️ Application Previews
+
+Below are live screenshots of the Loan Operation Intelligence interface, showcasing the production dashboard, operations console, knowledge repository, and RAG evaluation hub.
+
+### 📊 Real-Time Operations Dashboard
+*View live call sessions, system stream logs, latency indicators, and connection status alerts.*
+<p align="center">
+  <img src="assets/dashboard.png" alt="Real-time Operations Dashboard" width="100%" />
+</p>
+
+---
+
+### 🎙️ Voice Agent Operations Console
+*Launch Vapi call campaigns, trigger automated simulations, and audit live business tool executions.*
+<p align="center">
+  <img src="assets/ops_console.png" alt="Operations Console" width="100%" />
+</p>
+
+---
+
+### 📚 Knowledge Base Repository
+*Manage FAQ documents, policy materials, and compliance checklists synced to PostgreSQL and Pinecone.*
+<p align="center">
+  <img src="assets/knowledge_base.png" alt="Knowledge Base" width="100%" />
+</p>
+
+---
+
+### 🧪 Retrieval Precision Evaluation Hub
+*Run evaluations against golden queries, review exact precision metrics, and audit retrieval verdicts.*
+<p align="center">
+  <img src="assets/retrieval_test.png" alt="Retrieval Evaluation Hub" width="100%" />
+</p>
+
+---
+
+### 📈 Operational Analytics & Nudges
+*Track system performance, monitor average resolution times, and display live compliance indicators.*
+<p align="center">
+  <img src="assets/analytics.png" alt="Analytics" width="100%" />
+</p>
+
 ---
 
 ## 🏛️ Architecture Overview
