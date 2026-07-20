@@ -92,12 +92,15 @@ def create_app() -> FastAPI:
     # --- CORS Middleware ---
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[settings.FRONTEND_URL, "http://localhost:3000"],
+        allow_origins=[
+            "https://loan-operation-intelligence.vercel.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
     # --- Register Routers ---
     app.include_router(health.router, prefix="/api", tags=["Health"])
     app.include_router(
