@@ -1,10 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="Loan Operation Intelligence" width="120" />
-
-<br/>
-
-<img src="assets/banner.png" alt="Loan Operation Intelligence — AI Voice Platform" width="100%" />
+<img src="assets/landing.png" alt="Loan Operation Intelligence" width="100%" />
 
 <br/><br/>
 
@@ -30,7 +26,7 @@
 
 <br/>
 
-[Live Demo](#) · [Video Walkthrough](#) · [Architecture PDF](#) · [API Docs](#-api-documentation) · [System Design](#-system-design)
+[Live Demo](https://loan-operation-intelligence.vercel.app/) · [Video Walkthrough](https://drive.google.com/file/d/1hR9fkAwx0i1Q-R9VuoQk8MwY0zsJsrv3/view?usp=drive_link) · [Architecture PDF](docs/architecture.md) · [API Docs](#-api-documentation) · [System Design](#-system-design)
 
 </div>
 
@@ -689,9 +685,9 @@ loan-operation-intelligence/
 
 | Resource | Link |
 | --- | --- |
-| 🔴 Live Demo | [Add deployed URL here](#) |
-| 🎥 Video Walkthrough | [Add video link here](#) |
-| 📄 Architecture PDF | [Add architecture document here](#) |
+| 🔴 Live Demo | [Launch Demo](https://loan-operation-intelligence.vercel.app/) |
+| 🎥 Video Walkthrough | [Watch Walkthrough](https://drive.google.com/file/d/1hR9fkAwx0i1Q-R9VuoQk8MwY0zsJsrv3/view?usp=drive_link) |
+| 📄 Architecture PDF | [View Architecture Schema](docs/architecture.md) |
 
 <div align="center">
 
