@@ -681,7 +681,7 @@ loan-operation-intelligence/
 
 <div align="center">
 
-![Demo](assets/demo.gif)
+![Demo](assets/demo.png)
 
 *End-to-end walkthrough: outbound call → grounded knowledge retrieval → live nudge → dashboard update*
 
@@ -697,7 +697,7 @@ loan-operation-intelligence/
 
 | Dashboard | Knowledge Search | Voice Agent |
 | :---: | :---: | :---: |
-| ![Dashboard Demo](assets/dashboard.gif) | ![Search Demo](assets/search.gif) | ![Voice Demo](assets/voice.gif) |
+| ![Dashboard Demo](assets/dashboard.png) | ![Search Demo](assets/search.png) | ![Voice Demo](assets/live-call.png) |
 
 </div>
 
