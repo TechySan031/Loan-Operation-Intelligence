@@ -5,7 +5,6 @@ All configuration is loaded from environment variables / .env file.
 Validates at startup so missing keys fail fast.
 """
 
-from transformers.models.chameleon import image_processing_chameleon_fast
 import os
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -85,7 +84,7 @@ class Settings(BaseSettings):
     PII_DETECTION_THRESHOLD: float = 0.7
 
     def model_post_init(self, __context):
-        # Convert Railway DATABASE_URL to asyncpg format
+        # Convert Railway DATABASE_URL to asyncpg format (only if not already asyncpg)
         if self.DATABASE_URL.startswith("postgresql://"):
             self.DATABASE_URL = self.DATABASE_URL.replace(
                 "postgresql://",

@@ -8,6 +8,8 @@ Provides:
 - Startup/shutdown lifecycle hooks
 """
 
+from typing import AsyncGenerator
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -23,12 +25,18 @@ class Base(DeclarativeBase):
     pass
 
 
+from app.models import *  # noqa: E402  — must come after Base is defined
+
+
 # --- Engine & Session Factory ---
-database_url = settings.DATABASE_URL.replace(
-    "postgresql://",
-    "postgresql+asyncpg://",
-    1,
-)
+# Ensure the URL always uses the asyncpg driver prefix, but never double-apply it.
+_raw_url = settings.DATABASE_URL
+if "postgresql+asyncpg://" in _raw_url:
+    database_url = _raw_url
+elif _raw_url.startswith("postgresql://"):
+    database_url = _raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+else:
+    database_url = _raw_url
 
 print("DATABASE URL:", database_url)
 
@@ -60,7 +68,7 @@ async def close_db():
 
 
 # --- FastAPI Dependency ---
-async def get_db() -> AsyncSession:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency that provides an async database session.
     Usage in routes:

@@ -2,14 +2,14 @@
   "summary": {
     "total_tests": 7,
     "verdicts": {
-      "correct": 7,
-      "partially_correct": 0,
-      "incorrect": 0,
+      "correct": 3,
+      "partially_correct": 3,
+      "incorrect": 1,
       "error": 0
     },
-    "accuracy": 1.0,
-    "partial_or_better": 1.0,
-    "avg_retrieval_time_ms": 474.33
+    "accuracy": 0.43,
+    "partial_or_better": 0.86,
+    "avg_retrieval_time_ms": 528.95
   },
   "results": [
     {
@@ -32,14 +32,14 @@
       "match_ratio": 1.0,
       "verdict": "correct",
       "top_result": {
-        "record_id": "kb_policy_001",
-        "title": "Late Payment Penalty",
-        "relevance_score": 0.8006,
-        "source": "loan_policy_document",
-        "content_preview": "If an EMI is overdue, a late payment penalty of 2% per month is charged on the overdue amount. Additional fees may apply based on the loan agreement."
+        "record_id": "kb_policy_late_payment_001",
+        "title": "Late Payment Penalty Structure",
+        "relevance_score": 0.7664,
+        "source": "website",
+        "content_preview": "If the EMI payment is not received by the due date, a late payment fee of 2% of the overdue EMI amount or \u20b9500 (whichever is higher) will be charged. The penalty is applied after a 3-day grace period "
       },
       "total_results": 3,
-      "retrieval_time_ms": 1236.13
+      "retrieval_time_ms": 1212.47
     },
     {
       "test_id": "rag_002",
@@ -52,23 +52,18 @@
         "UPI",
         "auto-debit"
       ],
-      "matched_keywords": [
-        "online",
-        "bank transfer",
-        "UPI",
-        "auto-debit"
-      ],
-      "match_ratio": 1.0,
-      "verdict": "correct",
+      "matched_keywords": [],
+      "match_ratio": 0.0,
+      "verdict": "incorrect",
       "top_result": {
-        "record_id": "kb_payment_001",
-        "title": "EMI Payment Methods",
-        "relevance_score": 0.7857,
-        "source": "loan_policy_document",
-        "content_preview": "Customers can pay EMIs using online banking, bank transfer, UPI, debit card, auto-debit, NEFT, RTGS or by visiting the nearest branch."
+        "record_id": "kb_payment_restructuring_001",
+        "title": "Loan Restructuring Options",
+        "relevance_score": 0.6524,
+        "source": "website",
+        "content_preview": "Loan restructuring allows modification of loan terms to make payments more manageable: 1) Tenure Extension \u2014 extend the loan period by up to 24 months to reduce monthly EMI (e.g., \u20b915,000 EMI becomes "
       },
-      "total_results": 3,
-      "retrieval_time_ms": 339.57
+      "total_results": 2,
+      "retrieval_time_ms": 411.97
     },
     {
       "test_id": "rag_003",
@@ -94,7 +89,7 @@
         "content_preview": "When a borrower expresses financial difficulty, respond with empathy: 'I understand you're going through a challenging time. We have several options that may help.' Available options include: 1) EMI H"
       },
       "total_results": 3,
-      "retrieval_time_ms": 360.69
+      "retrieval_time_ms": 416.42
     },
     {
       "test_id": "rag_004",
@@ -116,14 +111,14 @@
       "match_ratio": 1.0,
       "verdict": "correct",
       "top_result": {
-        "record_id": "kb_policy_002",
-        "title": "Non-Performing Asset Policy",
-        "relevance_score": 0.7882,
-        "source": "loan_policy_document",
-        "content_preview": "A loan is classified as a Non-Performing Asset (NPA) if installments remain overdue for more than 90 days. An NPA classification may negatively affect the customer's credit score and future borrowing "
+        "record_id": "kb_policy_late_payment_001",
+        "title": "Late Payment Penalty Structure",
+        "relevance_score": 0.7091,
+        "source": "website",
+        "content_preview": "If the EMI payment is not received by the due date, a late payment fee of 2% of the overdue EMI amount or \u20b9500 (whichever is higher) will be charged. The penalty is applied after a 3-day grace period "
       },
       "total_results": 3,
-      "retrieval_time_ms": 360.5
+      "retrieval_time_ms": 524.29
     },
     {
       "test_id": "rag_005",
@@ -136,21 +131,19 @@
         "foreclosure"
       ],
       "matched_keywords": [
-        "prepay",
-        "home loan",
-        "foreclosure"
+        "home loan"
       ],
-      "match_ratio": 1.0,
-      "verdict": "correct",
+      "match_ratio": 0.33,
+      "verdict": "partially_correct",
       "top_result": {
-        "record_id": "kb_product_001",
-        "title": "Home Loan Prepayment",
-        "relevance_score": 0.7753,
-        "source": "loan_policy_document",
-        "content_preview": "Customers may prepay or foreclose their home loan before maturity. Foreclosure charges, if applicable, depend on the loan agreement and regulatory guidelines."
+        "record_id": "kb_product_home_loan_001",
+        "title": "Home Loan Overview",
+        "relevance_score": 0.6873,
+        "source": "website",
+        "content_preview": "Home loans available from \u20b95,00,000 to \u20b95,00,00,000 with interest rates starting at 8.35% per annum. Tenure up to 30 years. Loan-to-value ratio up to 80% for properties up to \u20b930 lakhs and 75% for hig"
       },
-      "total_results": 3,
-      "retrieval_time_ms": 328.5
+      "total_results": 2,
+      "retrieval_time_ms": 385.35
     },
     {
       "test_id": "rag_006",
@@ -162,20 +155,19 @@
         "grievance"
       ],
       "matched_keywords": [
-        "complaint",
-        "grievance"
+        "complaint"
       ],
-      "match_ratio": 1.0,
-      "verdict": "correct",
+      "match_ratio": 0.5,
+      "verdict": "partially_correct",
       "top_result": {
-        "record_id": "kb_escalation_001",
-        "title": "Complaint and Grievance Handling",
-        "relevance_score": 0.7284,
-        "source": "loan_policy_document",
-        "content_preview": "Customers may register a complaint through customer care, email, or the grievance portal. Unresolved complaints can be escalated to the grievance officer."
+        "record_id": "kb_escalation_criteria_001",
+        "title": "When to Escalate to Human Agent",
+        "relevance_score": 0.5904,
+        "source": "manual",
+        "content_preview": "Escalate the call to a human agent in the following situations: 1) Customer explicitly requests to speak with a human agent \u2014 always honor this request. 2) Identity verification fails after 3 attempts"
       },
-      "total_results": 2,
-      "retrieval_time_ms": 355.3
+      "total_results": 1,
+      "retrieval_time_ms": 380.42
     },
     {
       "test_id": "rag_007",
@@ -187,11 +179,10 @@
         "3 days"
       ],
       "matched_keywords": [
-        "grace period",
-        "3 days"
+        "grace period"
       ],
-      "match_ratio": 1.0,
-      "verdict": "correct",
+      "match_ratio": 0.5,
+      "verdict": "partially_correct",
       "top_result": {
         "record_id": "kb_policy_grace_period_001",
         "title": "Grace Period Policy",
@@ -200,7 +191,7 @@
         "content_preview": "A grace period of 3 calendar days is provided after the EMI due date. No late payment fee is charged if the payment is received within this grace period. However, this grace period does not extend to "
       },
       "total_results": 3,
-      "retrieval_time_ms": 339.6
+      "retrieval_time_ms": 371.71
     }
   ]
 }

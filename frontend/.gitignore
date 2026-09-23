@@ -64,3 +64,17 @@ node_modules/
 # IDE
 .vscode/
 .idea/
+
+# Python caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# macOS
+.AppleDouble
+.LSOverride
